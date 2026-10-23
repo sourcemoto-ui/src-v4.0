@@ -250,7 +250,7 @@
 
 
 
-        const DEFAULT_GAS_URL = "https://script.google.com/macros/s/AKfycbzwnZ9i6esZSJxuLSOuvdn5CIq5C0Aea-zt1MGwTevz8KsDybyouxMJgNjPG31fluEvig/exec";
+        const DEFAULT_GAS_URL = "https://script.google.com/macros/s/AKfycbyR9z1RDd4kVdIFdXd79Eb2IZzwZaofd6jzO69vbakI9DQ_XLgdt94-j_P_0rki34wI3w/exec";
 
 
 
@@ -437,7 +437,19 @@
 
             if (dateVal instanceof Date && !isNaN(dateVal.getTime())) return dateVal;
 
-            const s = String(dateVal).trim();
+            const s = String(dateVal).trim().replace(/^["']+|["']+$/g, '');
+
+            if (!s) return new Date();
+
+            const zhMatch = s.match(/(\d{4})\s*[年\/\-\.]\s*(\d{1,2})\s*[月\/\-\.]\s*(\d{1,2})/);
+
+            if (zhMatch) {
+
+                const dt = new Date(parseInt(zhMatch[1], 10), parseInt(zhMatch[2], 10) - 1, parseInt(zhMatch[3], 10));
+
+                if (!isNaN(dt.getTime())) return dt;
+
+            }
 
             const d = new Date(s);
 
@@ -590,22 +602,27 @@
                 ? items.filter(i => i && ((typeof i === 'string' && i.trim() !== '') || (typeof i === 'object' && (i.name || i.desc))))
                 : [];
             if (validItems.length === 0) {
-                return typeof fallbackHumanItems === 'string' ? fallbackHumanItems : '';
+                return (fallbackHumanItems && typeof fallbackHumanItems === 'string') ? fallbackHumanItems : '';
             }
             return validItems.map(i => {
                 if (typeof i === 'string') return i.trim();
                 const st = getItemStatus(i);
                 const stTag = st === 'fulfilled' ? '✅已到貨' : (st === 'processing' ? '🔄處理中' : '⬜待料中');
                 const mech = Object.keys(i.mechanics || {}).filter(k => i.mechanics[k]).join('、');
-                let text = `${stTag} ${i.name || i.desc || '維修項目'} [數量:${i.qty || 1}]`;
+                let text = `${stTag} ${i.name || i.desc} [數量:${i.qty || 1}]`;
                 if (mech) text += ` 👨‍🔧技師:${mech}`;
                 return text;
             }).join(' ｜ ');
         };
 
-        const normalizeRecord = (r) => {
+        const normalizeRecord = (r, fallbackIdx = 0) => {
 
             if (!r || typeof r !== 'object') return r;
+
+            // ★ 確保每一筆歷史工單都有唯一且穩定的 ID，防止 6~10 月舊工單因缺 ID 或重複 ID 被覆蓋消失
+            const safeId = (r.id && String(r.id).trim() !== '' && String(r.id) !== 'undefined')
+                ? String(r.id).trim()
+                : `HIST_${r.monthStr || 'REC'}_${r.date || 'NODATE'}_${r.plate || 'NOPLATE'}_${r.total || 0}_${fallbackIdx}`;
 
             // ★ 修正 JS 空陣列 [] Truthy 陷阱：明確檢查有效品項長度，若 items 無內容則自動由 human_items 還原
             const fromItems = normalizeItems(r.items).filter(i => i && ((typeof i === 'string' && i.trim() !== '') || (i.name && String(i.name).trim() !== '')));
@@ -640,10 +657,18 @@
                 ? '已完工'
                 : (r.progressStage || '維修中');
 
+            // 若歷史工單缺少 date 但有 monthStr（例如從 維修紀錄_2026-06 讀出），自動補齊該月日期以確保區間篩選能命中
+            let safeDate = r.date || r.completedDate || '';
+            if (!safeDate && r.monthStr && /^\d{4}-\d{2}$/.test(String(r.monthStr))) {
+                safeDate = `${r.monthStr}-01`;
+            }
+
             return {
 
                 ...r,
 
+                id: safeId,
+                date: safeDate || r.date,
                 status: normalizedStatus,
                 progressStage: normalizedStage,
                 items,
@@ -3037,17 +3062,25 @@
 
             const { filteredCompletedRecords, totalCompletedRevenue, cashRevenue, transferRevenue, avgOrderPrice } = useMemo(() => {
 
-                const startDt = new Date(startYear, startMonth - 1, 1).getTime();
+                const startYm = startYear * 100 + Number(startMonth);
 
-                const endDt = new Date(endYear, endMonth, 0, 23, 59, 59).getTime();
+                const endYm = endYear * 100 + Number(endMonth);
 
 
 
                 const filtered = (records || []).filter(r => r && r.status === 'completed').filter(r => {
 
-                    const rDate = parseDateSafe(r.timestamp || r.date).getTime();
+                    // 優先檢查所屬月份標籤 (monthStr，如 "2026-06")，確保 6~10 月分頁資料 100% 精準命中
+                    let recYm = null;
+                    if (r.monthStr && /^\d{4}-\d{1,2}$/.test(String(r.monthStr).trim())) {
+                        const parts = String(r.monthStr).trim().split('-');
+                        recYm = parseInt(parts[0], 10) * 100 + parseInt(parts[1], 10);
+                    } else {
+                        const dObj = parseDateSafe(r.completedDate || r.date || r.timestamp);
+                        recYm = dObj.getFullYear() * 100 + (dObj.getMonth() + 1);
+                    }
 
-                    const inRange = rDate >= startDt && rDate <= endDt;
+                    const inRange = recYm >= startYm && recYm <= endYm;
 
                     if (!inRange) return false;
 
@@ -4409,99 +4442,15 @@ ${JSON.stringify(catalogSummary)}
 
                     const parsedData = JSON.parse(jsonText);
 
-
-
-                    // 套用 Gemini 辨識出的客戶與車籍資訊
-
-                    setQuoteCustomer(prev => ({
-
-                        ...prev,
-
-                        plate: parsedData.plate ? String(parsedData.plate).toUpperCase().trim() : prev.plate,
-
-                        name: parsedData.name ? String(parsedData.name).trim() : prev.name,
-
-                        phone: parsedData.phone ? String(parsedData.phone).trim() : prev.phone,
-
-                        bikeModel: parsedData.bikeModel ? String(parsedData.bikeModel).trim() : prev.bikeModel,
-
-                        note: parsedData.note ? String(parsedData.note).trim() : prev.note
-
-                    }));
-
-
-
-                    // 套用 Gemini 辨識出的項目明細
-
-                    if (Array.isArray(parsedData.items) && parsedData.items.length > 0) {
-
-                        const formattedItems = parsedData.items.map((it, idx) => ({
-
-                            id: Date.now() + idx,
-
-                            name: String(it.name || '').trim(),
-
-                            partsPrice: Number(it.partsPrice || 0),
-
-                            laborHours: Number(it.laborHours || 0),
-
-                            qty: Math.max(1, Number(it.qty || 1))
-
-                        })).filter(it => it.name);
-
-
-
-                        if (formattedItems.length > 0) {
-
-                            setQuoteItems(formattedItems);
-
-                            showAlert(`⚡ Google Gemini AI 智慧分析完成！\n\n• 辨識車牌：${parsedData.plate || '未提及'}\n• 車主稱呼：${parsedData.name || '未提及'}\n• 車種車型：${parsedData.bikeModel || '未提及'}\n• 辨識施工明細：共 ${formattedItems.length} 項\n\nGemini 已精準推算零件費與工時並自動填入下方報價單！`);
-
-                        } else {
-
-                            showAlert('Gemini 已完成對話理解，但未在文字中發現具體的維修零件項目，請手動增補。');
-
-                        }
-
-                    } else {
-
-                        showAlert('Gemini 已提取車籍基本資料；未能抓取到施工項目，您可手動增列。');
-
-                    }
+                    applyParsedQuoteData(parsedData, true);
 
                 } catch (err) {
 
-                    console.warn("Gemini API 調用失敗，啟動備用規則解析:", err);
+                    console.warn("Gemini AI 解析降級至本機規則引擎:", err);
 
-                    // 降級容錯處理
+                    const fallbackData = fallbackLocalParse(aiInputText);
 
-                    const fallback = fallbackLocalParse(aiInputText);
-
-                    setQuoteCustomer(prev => ({
-
-                        ...prev,
-
-                        plate: fallback.plate || prev.plate,
-
-                        name: fallback.name || prev.name,
-
-                        phone: fallback.phone || prev.phone,
-
-                        bikeModel: fallback.bikeModel || prev.bikeModel
-
-                    }));
-
-                    if (fallback.items && fallback.items.length > 0) {
-
-                        setQuoteItems(fallback.items);
-
-                        showAlert(`⚠️ 雲端 Gemini AI 連線暫時無法使用 (${err.message})。\n系統已自動啟動【本機備用解析引擎】帶入 ${fallback.items.length} 項工單細項！`);
-
-                    } else {
-
-                        showAlert(`AI 解析遭遇問題：${err.message}，請確認網路連線。`);
-
-                    }
+                    applyParsedQuoteData(fallbackData, false);
 
                 } finally {
 
@@ -4513,93 +4462,121 @@ ${JSON.stringify(catalogSummary)}
 
 
 
-            const addQuoteItem = () => setQuoteItems([...quoteItems, { id: Date.now(), name: '', partsPrice: 0, laborHours: 0, qty: 1 }]);
+            const applyParsedQuoteData = (data, isFromCloudAi) => {
 
-            const removeQuoteItem = (id) => { if (quoteItems.length > 1) setQuoteItems(quoteItems.filter(i => i.id !== id)); };
+                if (!data) return;
 
-            const updateQuoteItem = (id, field, val) => setQuoteItems(quoteItems.map(i => i.id === id ? { ...i, [field]: val } : i));
+                setQuoteCustomer(prev => ({
 
+                    ...prev,
 
+                    plate: data.plate ? String(data.plate).toUpperCase() : prev.plate,
 
-            const quoteTotal = quoteItems.reduce((sum, it) => sum + ((evaluateMathExpression(it.partsPrice, 0) + (evaluateMathExpression(it.laborHours, 0) * hourlyRate)) * Number(it.qty || 1)), 0);
+                    name: data.name || prev.name,
 
+                    phone: data.phone || prev.phone,
 
+                    bikeModel: data.bikeModel || prev.bikeModel,
 
-            const generateQuoteText = () => {
+                    note: data.note || prev.note
 
-                let txt = `【${shopInfo.name || '車行'}】維修改裝預估報價單\n`;
+                }));
 
-                txt += `車牌號碼: ${quoteCustomer.plate || '未提供'}\n`;
+                if (Array.isArray(data.items) && data.items.length > 0) {
 
-                txt += `車主姓名: ${quoteCustomer.name || '車主'}\n`;
+                    const mapped = data.items.map((it, idx) => ({
 
-                txt += `報價日期: ${new Date().toLocaleDateString('zh-TW')}\n`;
+                        id: Date.now() + idx,
 
-                txt += `--------------------------\n`;
+                        name: it.name || '維修項目',
 
-                quoteItems.forEach((it, idx) => {
+                        partsPrice: cleanNumber(it.partsPrice, 0),
 
-                    const itemTotal = (evaluateMathExpression(it.partsPrice, 0) + (evaluateMathExpression(it.laborHours, 0) * hourlyRate)) * Number(it.qty || 1);
+                        laborHours: cleanNumber(it.laborHours, 0),
 
-                    txt += `${idx + 1}. ${it.name} x${it.qty || 1} = $${Math.round(itemTotal).toLocaleString()}\n`;
+                        qty: Math.max(1, Number(it.qty || 1))
 
-                });
+                    }));
 
-                txt += `--------------------------\n`;
+                    setQuoteItems(mapped);
 
-                txt += `預估總金額: $${Math.round(quoteTotal).toLocaleString()} 元\n`;
+                }
 
-                if (quoteCustomer.note) txt += `備註說明: ${quoteCustomer.note}\n`;
-
-                txt += `門市電話: ${shopInfo.phone || ''}\n門市地址: ${shopInfo.address || ''}`;
-
-                return txt;
-
-            };
-
-
-
-            const handleCopyQuoteToLine = () => {
-
-                const txt = generateQuoteText();
-
-                copyToClipboard(txt, () => {
-
-                    window.open(`https://line.me/R/msg/text/?${encodeURIComponent(txt)}`, '_blank');
-
-                });
+                showAlert(isFromCloudAi ? '✨ Gemini AI 已成功解析對話並帶入報價明細！' : '⚡ 已透過本機智慧規則引擎解析並帶入報價單！');
 
             };
 
 
 
-            const handleConvertToOrder = () => {
+            const addQuoteItem = () => {
+
+                setQuoteItems([...quoteItems, { id: Date.now(), name: '', partsPrice: 0, laborHours: 0, qty: 1 }]);
+
+            };
+
+
+
+            const updateQuoteItem = (id, field, val) => {
+
+                setQuoteItems(quoteItems.map(i => i.id === id ? { ...i, [field]: val } : i));
+
+            };
+
+
+
+            const removeQuoteItem = (id) => {
+
+                if (quoteItems.length > 1) setQuoteItems(quoteItems.filter(i => i.id !== id));
+
+            };
+
+
+
+            const quoteTotal = quoteItems.reduce((sum, i) => {
+
+                return sum + (evaluateMathExpression(i.partsPrice, 0) + (evaluateMathExpression(i.laborHours, 0) * hourlyRate)) * Number(i.qty || 1);
+
+            }, 0);
+
+
+
+            const convertQuoteToOrder = () => {
 
                 setDraftOrder({
 
                     ...INITIAL_ORDER_STATE,
 
-                    plate: (quoteCustomer.plate || '').toUpperCase(),
+                    plate: quoteCustomer.plate ? String(quoteCustomer.plate).toUpperCase() : '',
 
                     name: quoteCustomer.name || '',
 
                     phone: quoteCustomer.phone || '',
 
+                    email: quoteCustomer.email || '',
+
+                    bikeModel: quoteCustomer.bikeModel || '',
+
                     notes: quoteCustomer.note || '',
 
-                    items: quoteItems.map(it => ({
+                    items: quoteItems.map((it, idx) => ({
 
-                        ...it,
+                        id: Date.now() + idx,
+
+                        name: it.name,
 
                         partsPrice: evaluateMathExpression(it.partsPrice, 0),
 
                         laborHours: evaluateMathExpression(it.laborHours, 0),
 
+                        qty: Number(it.qty || 1),
+
                         itemStatus: 'pending',
 
                         fulfilled: false,
 
-                        mechanics: {}
+                        mechanics: {},
+
+                        isBasicMaintenance: isBasicMaintenanceItem(it.name)
 
                     }))
 
@@ -4611,55 +4588,83 @@ ${JSON.stringify(catalogSummary)}
 
 
 
-            const adjustStock = (id, delta) => {
+            const shareQuoteToLine = () => {
 
-                setQuickServices(quickServices.map(s => s.id === id ? { ...s, stock: Math.max(0, (s.stock || 0) + delta) } : s));
+                let txt = `【${shopInfo.name || 'Source Moto'}】維修保養估價單\n`;
+
+                if (quoteCustomer.plate) txt += `車牌：${quoteCustomer.plate}\n`;
+
+                if (quoteCustomer.name) txt += `車主：${quoteCustomer.name}\n`;
+
+                if (quoteCustomer.bikeModel) txt += `車種：${quoteCustomer.bikeModel}\n`;
+
+                txt += `--------------------------\n`;
+
+                quoteItems.forEach((it, idx) => {
+
+                    const sub = Math.round((evaluateMathExpression(it.partsPrice, 0) + (evaluateMathExpression(it.laborHours, 0) * hourlyRate)) * Number(it.qty || 1));
+
+                    txt += `${idx + 1}. ${it.name} x${it.qty || 1} = $${sub.toLocaleString()}\n`;
+
+                });
+
+                txt += `--------------------------\n`;
+
+                txt += `預估總計：$${Math.round(quoteTotal).toLocaleString()} 元\n`;
+
+                if (quoteCustomer.note) txt += `備註：${quoteCustomer.note}\n`;
+
+                copyToClipboard(txt, () => {
+
+                    window.open(`https://line.me/R/msg/text/?${encodeURIComponent(txt)}`, '_blank');
+
+                });
 
             };
 
 
 
+            const adjustStock = (id, delta) => {
+
+                setQuickServices(prev => prev.map(s => s.id === id ? { ...s, stock: Math.max(0, Number(s.stock || 0) + delta) } : s));
+
+            };
+
+
+
+            const lowStockCount = (quickServices || []).filter(s => s.stock !== undefined && s.stock < (s.minStock || 5)).length;
+
+
+
             return (
 
-                <div className="max-w-6xl mx-auto space-y-5 pb-24 text-xs">
+                <div className="max-w-6xl mx-auto space-y-4 pb-24 text-xs">
 
-                    <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 bg-white p-4 rounded-2xl border border-slate-200 shadow-xs">
+                    <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-xs flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
 
                         <div>
 
                             <h2 className="text-lg font-black text-slate-800 flex items-center gap-2">
 
-                                <Package className="text-blue-600" size={22}/> 雲端報價單與備料總管
+                                <Package className="text-blue-600" size={22}/> 雲端 AI 智慧報價 & 零件備料總管
 
                             </h2>
 
-                            <p className="text-slate-400 text-xs mt-0.5">即時估算客戶維修改裝報價，並隨時掌握各供料廠商與零件庫存警戒水位</p>
+                            <p className="text-slate-400 text-xs mt-0.5">支援 LINE 詢價對話 AI 自動生成估價單、一鍵轉正式工單與低水位零件叫料管理</p>
 
                         </div>
 
-                        <div className="flex bg-slate-100 p-1 rounded-xl">
+                        <div className="flex bg-slate-100 p-1 rounded-xl w-full sm:w-auto">
 
-                            <button 
+                            <button onClick={() => setTab('inventory')} className={`flex-1 sm:flex-none px-4 py-2 rounded-lg font-bold transition-all ${tab === 'inventory' ? 'bg-blue-600 text-white shadow-xs' : 'text-slate-600'}`}>
 
-                                onClick={() => setTab('inventory')}
-
-                                className={`px-4 py-2 rounded-lg font-bold transition-all flex items-center gap-1.5 ${tab === 'inventory' ? 'bg-blue-600 text-white shadow-xs' : 'text-slate-600 hover:text-slate-900'}`}
-
-                            >
-
-                                <Package size={16}/> 備料庫存管理
+                                📦 備料庫存管理 {lowStockCount > 0 && <span className="ml-1 bg-orange-500 text-white px-1.5 py-0.2 rounded-full text-[10px]">{lowStockCount}低</span>}
 
                             </button>
 
-                            <button 
+                            <button onClick={() => setTab('quote')} className={`flex-1 sm:flex-none px-4 py-2 rounded-lg font-bold transition-all ${tab === 'quote' ? 'bg-indigo-600 text-white shadow-xs' : 'text-slate-600'}`}>
 
-                                onClick={() => setTab('quote')}
-
-                                className={`px-4 py-2 rounded-lg font-bold transition-all flex items-center gap-1.5 ${tab === 'quote' ? 'bg-blue-600 text-white shadow-xs' : 'text-slate-600 hover:text-slate-900'}`}
-
-                            >
-
-                                <FileText size={16}/> 快速報價單製作
+                                ✨ AI 智慧估價單
 
                             </button>
 
@@ -4671,129 +4676,85 @@ ${JSON.stringify(catalogSummary)}
 
                     {tab === 'inventory' && (
 
-                        <div className="space-y-4">
+                        <div className="bg-white p-4 rounded-2xl border border-slate-200 space-y-4">
 
-                            <div className="flex justify-between items-center bg-orange-50/80 p-4 rounded-2xl border border-orange-200">
+                            <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2 border-b border-slate-100 pb-3">
 
-                                <div>
+                                <span className="font-bold text-slate-700 text-sm">門市常用零件庫存與安全水位監控</span>
 
-                                    <span className="font-black text-orange-950 text-sm block">低水位零件採購叫料 (PO)</span>
+                                <div className="flex gap-2">
 
-                                    <span className="text-slate-500 text-xs">自動依廠商彙整低於安全水位的零件清單</span>
+                                    <button type="button" onClick={() => setShowPOModal(true)} className="px-3.5 py-2 bg-orange-500 hover:bg-orange-600 text-white rounded-xl font-bold flex items-center gap-1.5 shadow-xs">
+
+                                        <FileText size={15}/> 產生低水位廠商叫料單 ({lowStockCount})
+
+                                    </button>
+
+                                    <button type="button" onClick={() => setView('settings')} className="px-3.5 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl font-bold">
+
+                                        編輯/新增品項
+
+                                    </button>
 
                                 </div>
-
-                                <button 
-
-                                    onClick={() => setShowPOModal(true)}
-
-                                    className="px-4 py-2 bg-orange-500 hover:bg-orange-600 text-white font-black rounded-xl text-xs flex items-center gap-1.5 shadow-xs"
-
-                                >
-
-                                    <Package size={16}/> 產生廠商叫料單
-
-                                </button>
 
                             </div>
 
 
 
-                            <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
+                            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
 
-                                <div className="overflow-x-auto">
+                                {(quickServices || []).map(s => {
 
-                                    <table className="w-full text-left text-xs min-w-[700px]">
+                                    const isLow = s.stock !== undefined && s.stock < (s.minStock || 5);
 
-                                        <thead>
+                                    return (
 
-                                            <tr className="bg-slate-50 border-b border-slate-200 text-slate-600 font-bold">
+                                        <div key={s.id} className={`p-3.5 rounded-xl border flex flex-col justify-between gap-2 ${isLow ? 'bg-orange-50/70 border-orange-300' : 'bg-slate-50/70 border-slate-200'}`}>
 
-                                                <th className="p-3.5">零件名稱</th>
+                                            <div className="flex justify-between items-start">
 
-                                                <th className="p-3.5 text-right">加總金額 (料+工)</th>
+                                                <div>
 
-                                                <th className="p-3.5 text-right">零件單價</th>
+                                                    <div className="font-black text-slate-800 text-sm">{s.name}</div>
 
-                                                <th className="p-3.5 text-right">標準工時</th>
+                                                    <div className="text-[11px] text-slate-500 mt-0.5">
 
-                                                <th className="p-3.5 text-center">目前庫存</th>
+                                                        料: ${s.partsPrice} | 工時: {s.laborHours}h | 廠商: {s.supplier || '未指定'}
 
-                                                <th className="p-3.5 text-center">安全水位</th>
+                                                    </div>
 
-                                                <th className="p-3.5 text-center">庫存快速調整</th>
+                                                </div>
 
-                                            </tr>
+                                                {isLow && <span className="bg-red-600 text-white text-[10px] font-black px-2 py-0.5 rounded-full animate-pulse">庫存偏低</span>}
 
-                                        </thead>
+                                            </div>
 
-                                        <tbody className="divide-y divide-slate-100">
+                                            <div className="flex justify-between items-center pt-2 border-t border-slate-200/70">
 
-                                            {quickServices.map(s => {
+                                                <span className="text-slate-600 font-bold">
 
-                                                const isLow = (s.stock !== undefined && s.stock < (s.minStock || 5));
-                                                const sParts = Number(s.partsPrice || s.price || 0);
-                                                const sLabor = Math.round(Number(s.laborHours || 0) * hourlyRate);
-                                                const sTotal = sParts + sLabor;
+                                                    目前存量: <strong className={`font-mono text-sm ${isLow ? 'text-red-600' : 'text-slate-900'}`}>{s.stock ?? 0}</strong> <span className="text-[10px] text-slate-400">(警戒:{s.minStock || 5})</span>
 
-                                                return (
+                                                </span>
 
-                                                    <tr key={s.id} className="hover:bg-slate-50/80">
+                                                <div className="flex gap-1">
 
-                                                        <td className="p-3.5 font-bold text-slate-800">
+                                                    <button type="button" onClick={() => adjustStock(s.id, -1)} className="px-2.5 py-1 bg-white border border-slate-300 hover:bg-slate-100 rounded-lg font-black">-1</button>
 
-                                                            {s.name}
+                                                    <button type="button" onClick={() => adjustStock(s.id, 1)} className="px-2.5 py-1 bg-white border border-slate-300 hover:bg-slate-100 rounded-lg font-black">+1</button>
 
-                                                            {s.isBasicMaintenance && <span className="ml-1 text-[10px] bg-amber-100 text-amber-800 px-1.5 py-0.5 rounded">免抽成</span>}
+                                                    <button type="button" onClick={() => adjustStock(s.id, 10)} className="px-2.5 py-1 bg-blue-600 text-white hover:bg-blue-700 rounded-lg font-bold">+10</button>
 
-                                                        </td>
+                                                </div>
 
-                                                        <td className="p-3.5 text-right">
-                                                            <div className="font-mono font-black text-blue-700 text-sm">${sTotal.toLocaleString()}</div>
-                                                            <div className="text-[10px] text-slate-400 font-mono">料 ${sParts.toLocaleString()} + 工 ${sLabor.toLocaleString()}</div>
-                                                        </td>
+                                            </div>
 
-                                                        <td className="p-3.5 text-right font-mono font-bold text-slate-700">${sParts.toLocaleString()}</td>
+                                        </div>
 
-                                                        <td className="p-3.5 text-right font-mono text-slate-500">{s.laborHours || 0} hr</td>
+                                    );
 
-                                                        <td className="p-3.5 text-center">
-
-                                                            <span className={`font-black px-2.5 py-1 rounded-full text-xs ${isLow ? 'bg-red-100 text-red-700 animate-pulse' : 'bg-slate-100 text-slate-700'}`}>
-
-                                                                {s.stock ?? '-'}
-
-                                                            </span>
-
-                                                        </td>
-
-                                                        <td className="p-3.5 text-center text-slate-400 font-bold">{s.minStock || 5}</td>
-
-                                                        <td className="p-3.5 text-center">
-
-                                                            <div className="flex justify-center items-center gap-1.5">
-
-                                                                <button onClick={() => adjustStock(s.id, -1)} className="w-6 h-6 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg font-black">-</button>
-
-                                                                <button onClick={() => adjustStock(s.id, 1)} className="w-6 h-6 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg font-black">+</button>
-
-                                                                <button onClick={() => adjustStock(s.id, 10)} className="px-1.5 py-0.5 bg-blue-50 hover:bg-blue-100 text-blue-700 rounded-md font-bold text-[10px]">+10</button>
-
-                                                            </div>
-
-                                                        </td>
-
-                                                    </tr>
-
-                                                );
-
-                                            })}
-
-                                        </tbody>
-
-                                    </table>
-
-                                </div>
+                                })}
 
                             </div>
 
@@ -4805,129 +4766,65 @@ ${JSON.stringify(catalogSummary)}
 
                     {tab === 'quote' && (
 
-                        <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs space-y-4">
+                        <div className="space-y-4">
 
-                            {/* AI 智慧對話與文字辨識報價面板 (Google Gemini 核心) */}
-
-                            <div className="bg-gradient-to-r from-blue-900/95 via-indigo-900/95 to-slate-900 text-white p-4 sm:p-5 rounded-2xl shadow-md space-y-3 border border-indigo-500/30">
+                            <div className="bg-gradient-to-br from-indigo-950 to-slate-900 text-white p-4 rounded-2xl shadow-md space-y-3">
 
                                 <div className="flex justify-between items-center">
 
-                                    <div className="flex items-center gap-2.5">
+                                    <div className="flex items-center gap-2">
 
-                                        <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-blue-400 to-indigo-600 text-white flex items-center justify-center shadow-md">
+                                        <Sparkle size={18} className="text-amber-400"/>
 
-                                            <Sparkle size={20} className="text-amber-300 animate-pulse" />
-
-                                        </div>
-
-                                        <div>
-
-                                            <h3 className="font-black text-sm text-white flex items-center gap-2">
-
-                                                <span>Google Gemini 3 Flash 智慧報價分析</span>
-
-                                                <span className="text-[10px] bg-emerald-500/20 text-emerald-300 border border-emerald-400/40 px-2 py-0.5 rounded-full font-bold flex items-center gap-1">
-
-                                                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span>
-
-                                                    Gemini 3 Flash 驅動
-
-                                                </span>
-
-                                            </h3>
-
-                                            <p className="text-[11px] text-slate-300">支援貼上整段 LINE 聊天、維修便條或語音轉文字，Gemini 自動深入判讀車籍、零件費算式、行情工時與數量</p>
-
-                                        </div>
+                                        <span className="font-black text-sm">Google Gemini 3 Flash 對話智慧辨識估價</span>
 
                                     </div>
 
-                                    <button
+                                    <button type="button" onClick={() => setShowAiPanel(!showAiPanel)} className="text-xs text-indigo-300 underline">
 
-                                        type="button"
-
-                                        onClick={() => setShowAiPanel(!showAiPanel)}
-
-                                        className="text-xs text-slate-300 hover:text-white underline font-bold px-2 py-1"
-
-                                    >
-
-                                        {showAiPanel ? '收合面板' : '展開 AI 辨識'}
+                                        {showAiPanel ? '收合面板' : '展開 AI 面板'}
 
                                     </button>
 
                                 </div>
 
-
-
                                 {showAiPanel && (
 
-                                    <div className="space-y-3 pt-1">
+                                    <div className="space-y-2.5">
 
                                         <textarea
 
-                                            rows="3"
+                                            rows={3}
 
                                             value={aiInputText}
 
                                             onChange={e => setAiInputText(e.target.value)}
 
-                                            placeholder="請直接貼上車主 LINE 詢價、私訊或隨手筆記，例如：&#10;王小明 0912345678 勁戰六代 ABC-1234&#10;要換 Motul 5100 機油、齒輪油、前煞車皮 850 工時 0.25，普利珠 500*2 檢查傳動"
+                                            placeholder="直接貼上車主 LINE 訊息或口語描述，例如：『老闆我是 ABC-1234 陳先生，我的勁戰六代想換 Motul 7100 機油、齒輪油，還要換前煞車皮跟檢查傳動』..."
 
-                                            className="w-full p-3 rounded-xl bg-slate-800/90 border border-slate-700 text-white text-xs placeholder-slate-400 outline-none focus:border-indigo-400 resize-none font-mono"
+                                            className="w-full p-3 rounded-xl bg-white/10 border border-white/20 text-white placeholder-slate-400 text-xs outline-none focus:border-amber-400"
 
                                         ></textarea>
 
+                                        <div className="flex justify-end">
 
+                                            <button
 
-                                        <div className="flex flex-wrap items-center justify-between gap-2">
+                                                type="button"
 
-                                            <span className="text-[11px] text-indigo-200/80 flex items-center gap-1">
+                                                onClick={handleAiParse}
 
-                                                💡 Gemini 具備語意推理，自動加總算式、比對門市標準庫存，未註記金額時自動估算合理行情
+                                                disabled={isAiParsing}
 
-                                            </span>
+                                                className="px-4 py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 font-black rounded-xl flex items-center gap-1.5 shadow-sm disabled:opacity-50"
 
-                                            <div className="flex gap-2">
+                                            >
 
-                                                {aiInputText && (
+                                                {isAiParsing ? <RefreshCw size={14} className="animate-spin"/> : <Sparkle size={14}/>}
 
-                                                    <button
+                                                <span>{isAiParsing ? 'AI 正在分析車籍與報價...' : '智慧解析並產生報價單'}</span>
 
-                                                        type="button"
-
-                                                        onClick={() => setAiInputText('')}
-
-                                                        className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold transition-colors"
-
-                                                    >
-
-                                                        清空文字
-
-                                                    </button>
-
-                                                )}
-
-                                                <button
-
-                                                    type="button"
-
-                                                    onClick={handleAiParse}
-
-                                                    disabled={isAiParsing}
-
-                                                    className="px-5 py-2 rounded-xl bg-gradient-to-r from-blue-500 via-indigo-500 to-purple-600 hover:from-blue-600 hover:to-purple-700 text-white text-xs font-black flex items-center gap-2 shadow-lg shadow-indigo-500/30 transition-all active:scale-95 disabled:opacity-50"
-
-                                                >
-
-                                                    {isAiParsing ? <RefreshCw size={15} className="animate-spin" /> : <Sparkle size={15} className="text-amber-300" />}
-
-                                                    <span>{isAiParsing ? 'Gemini 3 Flash 正在深度思考分析中...' : '✨ 交給 Gemini 智慧解析並帶入報價單'}</span>
-
-                                                </button>
-
-                                            </div>
+                                            </button>
 
                                         </div>
 
@@ -4939,93 +4836,73 @@ ${JSON.stringify(catalogSummary)}
 
 
 
-                            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                            <div className="bg-white p-4 rounded-2xl border border-slate-200 space-y-4">
 
-                                <div>
+                                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
 
-                                    <label className="text-xs font-bold text-slate-600 mb-1 block">客戶車牌</label>
+                                    <input type="text" placeholder="車牌號碼" value={quoteCustomer.plate} onChange={e => setQuoteCustomer({ ...quoteCustomer, plate: e.target.value.toUpperCase() })} className="p-2 border border-slate-300 rounded-xl font-black uppercase bg-yellow-50"/>
 
-                                    <input type="text" value={quoteCustomer.plate} onChange={e => setQuoteCustomer({...quoteCustomer, plate: e.target.value.toUpperCase()})} placeholder="如: ABC-123" className="w-full p-2 border border-slate-300 rounded-xl uppercase font-bold outline-none"/>
+                                    <input type="text" placeholder="車主稱呼" value={quoteCustomer.name} onChange={e => setQuoteCustomer({ ...quoteCustomer, name: e.target.value })} className="p-2 border border-slate-300 rounded-xl font-bold"/>
 
-                                </div>
+                                    <input type="text" placeholder="聯絡電話" value={quoteCustomer.phone} onChange={e => setQuoteCustomer({ ...quoteCustomer, phone: e.target.value })} className="p-2 border border-slate-300 rounded-xl"/>
 
-                                <div>
-
-                                    <label className="text-xs font-bold text-slate-600 mb-1 block">客戶姓名</label>
-
-                                    <input type="text" value={quoteCustomer.name} onChange={e => setQuoteCustomer({...quoteCustomer, name: e.target.value})} placeholder="車主姓名" className="w-full p-2 border border-slate-300 rounded-xl outline-none"/>
+                                    <input type="text" placeholder="車種型號" value={quoteCustomer.bikeModel} onChange={e => setQuoteCustomer({ ...quoteCustomer, bikeModel: e.target.value })} className="p-2 border border-slate-300 rounded-xl"/>
 
                                 </div>
 
-                                <div>
 
-                                    <label className="text-xs font-bold text-slate-600 mb-1 block">聯絡電話</label>
 
-                                    <input type="text" value={quoteCustomer.phone} onChange={e => setQuoteCustomer({...quoteCustomer, phone: e.target.value})} placeholder="手機號碼" className="w-full p-2 border border-slate-300 rounded-xl outline-none"/>
+                                <div className="space-y-2">
+
+                                    {quoteItems.map((it, idx) => (
+
+                                        <div key={it.id} className="flex flex-wrap sm:flex-nowrap items-center gap-2 bg-slate-50 p-2.5 rounded-xl border border-slate-200">
+
+                                            <span className="font-mono text-slate-400 w-5">{idx + 1}.</span>
+
+                                            <input type="text" placeholder="估價項目名稱" value={it.name} onChange={e => updateQuoteItem(it.id, 'name', e.target.value)} className="flex-1 p-2 border border-slate-300 rounded-lg bg-white font-bold"/>
+
+                                            <input type="text" placeholder="零件費" value={it.partsPrice} onChange={e => updateQuoteItem(it.id, 'partsPrice', e.target.value)} className="w-24 p-2 border border-slate-300 rounded-lg bg-white text-right font-mono"/>
+
+                                            <input type="number" step="0.05" placeholder="工時(h)" value={it.laborHours} onChange={e => updateQuoteItem(it.id, 'laborHours', e.target.value)} className="w-20 p-2 border border-slate-300 rounded-lg bg-white text-right font-mono"/>
+
+                                            <input type="number" min="1" value={it.qty} onChange={e => updateQuoteItem(it.id, 'qty', e.target.value)} className="w-16 p-2 border border-slate-300 rounded-lg bg-white text-center font-mono"/>
+
+                                            <button type="button" onClick={() => removeQuoteItem(it.id)} className="p-1.5 text-red-500 hover:bg-red-50 rounded-lg"><Trash2 size={15}/></button>
+
+                                        </div>
+
+                                    ))}
+
+                                    <button type="button" onClick={addQuoteItem} className="w-full py-2 border-2 border-dashed border-indigo-300 text-indigo-600 rounded-xl font-bold hover:bg-indigo-50">+ 新增估價項目</button>
 
                                 </div>
 
-                            </div>
 
 
+                                <div className="flex flex-col sm:flex-row justify-between items-center gap-3 pt-3 border-t border-slate-200">
 
-                            <div className="space-y-2 border-t border-slate-100 pt-3">
+                                    <div className="text-lg font-black text-slate-900 font-mono">
 
-                                <span className="font-bold text-slate-700 text-xs block">報價施工項目：</span>
-
-                                {quoteItems.map((it, idx) => (
-
-                                    <div key={it.id} className="flex gap-2 items-center bg-slate-50 p-2.5 rounded-xl border border-slate-200">
-
-                                        <span className="font-mono text-slate-400 w-4 text-center">{idx + 1}</span>
-
-                                        <input type="text" placeholder="品項名稱" value={it.name} onChange={e => updateQuoteItem(it.id, 'name', e.target.value)} className="flex-1 p-1.5 border border-slate-300 rounded-lg bg-white outline-none font-bold"/>
-
-                                        <input type="text" placeholder="零件費" value={it.partsPrice} onChange={e => updateQuoteItem(it.id, 'partsPrice', e.target.value)} className="w-24 p-1.5 border border-slate-300 rounded-lg bg-white outline-none font-mono text-right"/>
-
-                                        <input type="number" step="0.01" placeholder="工時(h)" value={it.laborHours} onChange={e => updateQuoteItem(it.id, 'laborHours', Number(e.target.value))} className="w-16 p-1.5 border border-slate-300 rounded-lg bg-white outline-none text-right font-mono"/>
-
-                                        <input type="number" min="1" value={it.qty} onChange={e => updateQuoteItem(it.id, 'qty', Number(e.target.value))} className="w-12 p-1.5 border border-slate-300 rounded-lg bg-white outline-none text-center font-bold"/>
-
-                                        <button onClick={() => removeQuoteItem(it.id)} className="p-1.5 text-red-400 hover:text-red-600 rounded-lg"><Trash2 size={16}/></button>
+                                        預估總計：${Math.round(quoteTotal).toLocaleString()}
 
                                     </div>
 
-                                ))}
+                                    <div className="flex gap-2 w-full sm:w-auto">
 
-                                <button onClick={addQuoteItem} className="w-full py-2 border-2 border-dashed border-blue-200 text-blue-600 rounded-xl font-bold flex items-center justify-center gap-1 hover:bg-blue-50">
+                                        <button type="button" onClick={shareQuoteToLine} className="flex-1 sm:flex-none px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-bold flex items-center justify-center gap-1.5">
 
-                                    <Plus size={15}/> 增加報價項目
+                                            <ShareNetwork size={15}/> 傳送 LINE 報價
 
-                                </button>
+                                        </button>
 
-                            </div>
+                                        <button type="button" onClick={convertQuoteToOrder} className="flex-1 sm:flex-none px-4 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-black flex items-center justify-center gap-1.5 shadow-xs">
 
+                                            <ArrowRight size={15}/> 一鍵轉為正式維修工單
 
+                                        </button>
 
-                            <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 border-t border-slate-200 pt-4">
-
-                                <div>
-
-                                    <span className="text-slate-400 text-xs block">預估報價總額</span>
-
-                                    <span className="text-2xl font-black text-blue-700 font-mono">${Math.round(quoteTotal).toLocaleString()}</span>
-
-                                </div>
-
-                                <div className="flex gap-2 w-full sm:w-auto">
-
-                                    <button onClick={handleCopyQuoteToLine} className="flex-1 sm:flex-none px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-bold flex items-center justify-center gap-1.5 shadow-xs">
-
-                                        <ShareNetwork size={16}/> 傳送至 LINE 報價
-
-                                    </button>
-
-                                    <button onClick={handleConvertToOrder} className="flex-1 sm:flex-none px-4 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-bold flex items-center justify-center gap-1.5 shadow-xs">
-
-                                        <Check size={16}/> 轉為維修工單
-
-                                    </button>
+                                    </div>
 
                                 </div>
 
@@ -5037,17 +4914,7 @@ ${JSON.stringify(catalogSummary)}
 
 
 
-                    <PurchaseOrderModal 
-
-                        isOpen={showPOModal} 
-
-                        onClose={() => setShowPOModal(false)} 
-
-                        quickServices={quickServices} 
-
-                        shopInfo={shopInfo} 
-
-                    />
+                    <PurchaseOrderModal isOpen={showPOModal} onClose={() => setShowPOModal(false)} quickServices={quickServices} shopInfo={shopInfo}/>
 
                 </div>
 
@@ -5059,261 +4926,89 @@ ${JSON.stringify(catalogSummary)}
 
         const RemindersView = ({ customers, setCustomers, records, shopInfo, gasUrl, isCloudEnabled, showAlert }) => {
 
-            const [filterTab, setFilterTab] = useState('all');
+            const [filterType, setFilterType] = useState('180');
 
-            const [searchTerm, setSearchTerm] = useState('');
+            const [emailModal, setEmailModal] = useState({ open: false, customer: null, email: '', subject: '', body: '' });
 
-            const [sendingId, setSendingId] = useState(null);
-
-            const [emailModal, setEmailModal] = useState({
-
-                isOpen: false,
-
-                customer: null,
-
-                email: '',
-
-                subject: '',
-
-                content: ''
-
-            });
-
-
-
-            const now = new Date().getTime();
+            const [isSending, setIsSending] = useState(false);
 
 
 
             const reminderList = useMemo(() => {
 
+                const now = new Date().getTime();
+
                 return (customers || []).map(c => {
 
-                    const cPlate = String(c?.plate || '').toUpperCase();
+                    const lastDt = parseDateSafe(c.lastVisit).getTime();
 
-                    const carRecords = (records || [])
+                    const diffDays = Math.max(0, Math.floor((now - lastDt) / (1000 * 60 * 60 * 24)));
 
-                        .filter(r => r && r.plate && String(r.plate).toUpperCase() === cPlate && r.status === 'completed')
+                    return { ...c, diffDays };
 
-                        .sort((a, b) => parseDateSafe(b.timestamp || b.date) - parseDateSafe(a.timestamp || a.date));
+                }).filter(c => {
 
-                    
+                    if (filterType === '180') return c.diffDays >= 180;
 
-                    const lastRec = carRecords[0];
-
-                    const lastDate = lastRec ? parseDateSafe(lastRec.timestamp || lastRec.date) : parseDateSafe(c?.lastVisit);
-
-                    const daysSince = Math.max(0, Math.floor((now - lastDate.getTime()) / (1000 * 60 * 60 * 24)));
-
-                    
-
-                    const isOilDue = daysSince >= 90 || (lastRec && lastRec.nextMileage && c?.lastMileage && Number(c.lastMileage) >= Number(lastRec.nextMileage));
-
-                    const insp = lastRec?.inspection || {};
-
-                    const hasSafetyIssue = insp.tires === '需更換' || insp.brakes === '需更換' || insp.belt === '需更換' || (insp.battery && parseFloat(insp.battery) < 12.2);
-
-
-
-                    return {
-
-                        customer: c,
-
-                        lastRec,
-
-                        lastDate,
-
-                        daysSince,
-
-                        isOilDue,
-
-                        hasSafetyIssue,
-
-                        inspection: insp
-
-                    };
-
-                });
-
-            }, [customers, records, now]);
-
-
-
-            const filteredList = useMemo(() => {
-
-                return reminderList.filter(item => {
-
-                    const c = item.customer;
-
-                    if (!c) return false;
-
-
-
-                    if (filterTab === 'oil' && !item.isOilDue) return false;
-
-                    if (filterTab === 'safety' && !item.hasSafetyIssue) return false;
-
-
-
-                    if (searchTerm) {
-
-                        const q = String(searchTerm).trim().toUpperCase();
-
-                        const plate = String(c.plate || '').toUpperCase();
-
-                        const name = String(c.name || '').toUpperCase();
-
-                        const phone = String(c.phone || '');
-
-                        if (!plate.includes(q) && !name.includes(q) && !phone.includes(q)) {
-
-                            return false;
-
-                        }
-
-                    }
+                    if (filterType === '365') return c.diffDays >= 365;
 
                     return true;
 
-                });
+                }).sort((a, b) => b.diffDays - a.diffDays);
 
-            }, [reminderList, filterTab, searchTerm]);
-
-
-
-            const handleOpenEmailModal = (item) => {
-
-                const c = item.customer;
-
-                const plate = c?.plate || '';
-
-                const name = c?.name || '車主';
-
-                const bike = c?.bikeModel || '愛車';
-
-                const days = item.daysSince;
-
-                const defaultSubject = `【${shopInfo?.name || 'Source Moto'}】定期機車保養貼心提醒 - ${plate}`;
+            }, [customers, filterType]);
 
 
 
-                let defaultContent = `親愛的 ${name} 您好：\n\n`;
+            const openReminderEmail = (c) => {
 
-                defaultContent += `感謝您一直以來對【${shopInfo?.name || 'Source Moto Custom'}】的支持與信賴！\n`;
+                const subj = `【${shopInfo.name || 'Source Moto'}】愛車 ${c.plate} 定期安全健檢與保養提醒`;
 
-                defaultContent += `系統貼心提醒您，您的愛車【${bike} (${plate})】距離上次回廠保養已約 ${days} 天。\n\n`;
+                const body = `親愛的 ${c.name || '車主'} 您好：\n\n感謝您一直以來對 ${shopInfo.name || '本店'} 的支持！\n系統紀錄顯示您的愛車【${c.plate} (${c.bikeModel || '機車'})】上次進廠日期為 ${formatDate(c.lastVisit)}（距今約 ${c.diffDays} 天，當時里程 ${c.lastMileage || '-'} km）。\n\n提醒您可抽空回廠進行機油、齒輪油、胎壓與煞車四大安全健檢，確保行車順暢安全！\n\n📍 門市地址：${shopInfo.address || ''}\n📞 預約電話：${shopInfo.phone || ''}`;
 
-
-
-                if (item.isOilDue) {
-
-                    defaultContent += `• 機油與耗材定期保養：已達建議保養週期，定時更換機油能有效延長引擎壽命並維持最佳動力。\n`;
-
-                }
-
-                if (item.hasSafetyIssue) {
-
-                    defaultContent += `• 車況健檢項目提醒：上次進廠檢查時，輪胎胎紋、煞車皮或電瓶電壓有需留意之狀況，建議回店由專業技師複檢。\n`;
-
-                }
-
-
-
-                defaultContent += `\n為確保您的行車安全與騎乘順暢，歡迎您抽空預約回店檢查與保養！\n\n`;
-
-                if (shopInfo?.phone) defaultContent += `門市電話：${shopInfo.phone}\n`;
-
-                if (shopInfo?.address) defaultContent += `門市地址：${shopInfo.address}\n`;
-
-                defaultContent += `祝您 行車平安、騎乘順心！`;
-
-
-
-                setEmailModal({
-
-                    isOpen: true,
-
-                    customer: c,
-
-                    email: c?.email || '',
-
-                    subject: defaultSubject,
-
-                    content: defaultContent
-
-                });
+                setEmailModal({ open: true, customer: c, email: c.email || '', subject: subj, body });
 
             };
 
 
 
-            const handleSendEmail = async () => {
+            const sendReminder = async () => {
 
-                const targetEmail = (emailModal.email || '').trim();
+                if (!emailModal.email || !emailModal.email.includes('@')) return showAlert('請輸入有效的客戶 Email 信箱');
 
-                if (!targetEmail || !targetEmail.includes('@')) {
+                setIsSending(true);
 
-                    return showAlert('請輸入有效的電子郵件地址 (Email)！');
+                const res = await safeFetchGAS(gasUrl, {
 
-                }
+                    action: 'send_maintenance_reminder',
 
-                if (!gasUrl) {
+                    email: emailModal.email.trim(),
 
-                    return showAlert('尚未設定 Google Apps Script 伺服器網址，無法發送 Email！');
+                    subject: emailModal.subject,
 
-                }
+                    customText: emailModal.body,
 
+                    shopInfo
 
+                });
 
-                setSendingId(emailModal.customer?.id || 'sending');
+                setIsSending(false);
 
-                try {
+                if (res.ok && res.data && res.data.status === 'success') {
 
-                    const res = await safeFetchGAS(gasUrl, {
+                    if (emailModal.customer && !emailModal.customer.email) {
 
-                        action: 'send_maintenance_reminder',
-
-                        email: targetEmail,
-
-                        subject: emailModal.subject,
-
-                        customText: emailModal.content,
-
-                        shopInfo: shopInfo
-
-                    }, 20000);
-
-
-
-                    if (res.ok && res.data && (res.data.status === 'success' || res.data.ok)) {
-
-                        if (emailModal.customer && emailModal.customer.email !== targetEmail) {
-
-                            const updated = customers.map(c => c.id === emailModal.customer.id ? { ...c, email: targetEmail } : c);
-
-                            setCustomers(updated);
-
-                            saveToLocalSafe('moto_customers', updated);
-
-                        }
-
-                        showAlert(`✅ 保養提醒 Email 已成功寄送至：${targetEmail}！`);
-
-                        setEmailModal({ isOpen: false, customer: null, email: '', subject: '', content: '' });
-
-                    } else {
-
-                        showAlert(`❌ 寄送失敗：${res.error || res.data?.message || '雲端伺服器回應異常'}`);
+                        setCustomers(prev => prev.map(x => x.plate === emailModal.customer.plate ? { ...x, email: emailModal.email.trim() } : x));
 
                     }
 
-                } catch (err) {
+                    showAlert(`✅ 保養提醒信已成功發送至 ${emailModal.email}！`);
 
-                    showAlert(`❌ 寄送發生錯誤：${err.message}`);
+                    setEmailModal({ open: false, customer: null, email: '', subject: '', body: '' });
 
-                } finally {
+                } else {
 
-                    setSendingId(null);
+                    showAlert(`❌ 寄送失敗：${res.error || '請確認網路與 Apps Script 權限'}`);
 
                 }
 
@@ -5323,83 +5018,41 @@ ${JSON.stringify(catalogSummary)}
 
             return (
 
-                <div className="max-w-6xl mx-auto space-y-4 pb-24 text-xs">
+                <div className="max-w-5xl mx-auto space-y-4 pb-24 text-xs">
 
-                    <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 bg-white p-4 rounded-2xl border border-slate-200 shadow-xs">
+                    <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-xs flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
 
                         <div>
 
                             <h2 className="text-lg font-black text-slate-800 flex items-center gap-2">
 
-                                <Bell className="text-blue-600" size={22}/> 車主保養提醒與 Email 智慧推播
+                                <Bell className="text-blue-600" size={22}/> 客戶定期保養關懷提醒
 
                             </h2>
 
-                            <p className="text-slate-400 text-xs mt-0.5">根據進廠週期、行駛里程與四大健檢安全項目，一鍵發送客製化 Email 保養通知</p>
+                            <p className="text-slate-400 text-xs mt-0.5">自動篩選逾半年或一年未回廠之車主，支援一鍵寄送保養通知信或 LINE 關懷訊息</p>
 
                         </div>
 
-                        <div className="flex flex-col sm:flex-row items-center gap-2 w-full sm:w-auto">
+                        <div className="flex bg-slate-100 p-1 rounded-xl">
 
-                            <div className="flex bg-slate-100 p-1 rounded-xl w-full sm:w-auto">
+                            {[
 
-                                <button 
+                                { id: '180', label: '逾半年未回店 (180天+)' },
 
-                                    onClick={() => setFilterTab('all')} 
+                                { id: '365', label: '逾一年未回店 (365天+)' },
 
-                                    className={`flex-1 sm:flex-none px-3 py-1.5 rounded-lg font-bold transition-all ${filterTab === 'all' ? 'bg-blue-600 text-white shadow-xs' : 'text-slate-600 hover:text-slate-900'}`}
+                                { id: 'all', label: '全部客戶名冊' }
 
-                                >
+                            ].map(t => (
 
-                                    全部 ({reminderList.length})
+                                <button key={t.id} onClick={() => setFilterType(t.id)} className={`px-3 py-1.5 rounded-lg font-bold transition-all ${filterType === t.id ? 'bg-blue-600 text-white shadow-xs' : 'text-slate-600'}`}>
 
-                                </button>
-
-                                <button 
-
-                                    onClick={() => setFilterTab('oil')} 
-
-                                    className={`flex-1 sm:flex-none px-3 py-1.5 rounded-lg font-bold transition-all ${filterTab === 'oil' ? 'bg-amber-600 text-white shadow-xs' : 'text-slate-600 hover:text-slate-900'}`}
-
-                                >
-
-                                    定檢/機油到期 ({reminderList.filter(i => i.isOilDue).length})
+                                    {t.label}
 
                                 </button>
 
-                                <button 
-
-                                    onClick={() => setFilterTab('safety')} 
-
-                                    className={`flex-1 sm:flex-none px-3 py-1.5 rounded-lg font-bold transition-all ${filterTab === 'safety' ? 'bg-red-600 text-white shadow-xs' : 'text-slate-600 hover:text-slate-900'}`}
-
-                                >
-
-                                    健檢異常 ({reminderList.filter(i => i.hasSafetyIssue).length})
-
-                                </button>
-
-                            </div>
-
-                            <div className="relative w-full sm:w-56">
-
-                                <Search className="absolute left-3 top-2.5 text-slate-400" size={15}/>
-
-                                <input 
-
-                                    type="text" 
-
-                                    placeholder="搜尋車牌、姓名或電話..." 
-
-                                    value={searchTerm} 
-
-                                    onChange={e => setSearchTerm(e.target.value)} 
-
-                                    className="w-full pl-9 pr-3 py-1.5 border border-slate-300 rounded-xl outline-none focus:border-blue-500 bg-slate-50 text-xs"
-
-                                />
-
-                            </div>
+                            ))}
 
                         </div>
 
@@ -5407,321 +5060,1458 @@ ${JSON.stringify(catalogSummary)}
 
 
 
-                    <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
+                    <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-xs">
 
-                        <div className="overflow-x-auto">
+                        <table className="w-full text-left text-xs min-w-[650px]">
 
-                            <table className="w-full text-left text-xs min-w-[760px]">
+                            <thead>
 
-                                <thead>
+                                <tr className="bg-slate-50 border-b border-slate-200 text-slate-600 font-bold">
 
-                                    <tr className="bg-slate-50 border-b border-slate-200 text-slate-600 font-bold">
+                                    <th className="p-3.5">車牌號碼</th>
 
-                                        <th className="p-3.5">車輛與車主</th>
+                                    <th className="p-3.5">車主姓名</th>
 
-                                        <th className="p-3.5">上次進廠與歷程</th>
+                                    <th className="p-3.5">聯絡電話 / Email</th>
 
-                                        <th className="p-3.5">車況健檢與保養診斷狀態</th>
+                                    <th className="p-3.5">上次進廠日</th>
 
-                                        <th className="p-3.5 text-center w-40">Email 推播提醒</th>
+                                    <th className="p-3.5">未回廠天數</th>
+
+                                    <th className="p-3.5 text-center">發送提醒</th>
+
+                                </tr>
+
+                            </thead>
+
+                            <tbody className="divide-y divide-slate-100">
+
+                                {reminderList.map(c => (
+
+                                    <tr key={c.id || c.plate} className="hover:bg-slate-50">
+
+                                        <td className="p-3.5 font-mono font-black text-blue-700 text-sm">{c.plate}</td>
+
+                                        <td className="p-3.5 font-bold text-slate-800">{c.name || '車主'} <span className="text-[10px] text-slate-400 block">{c.bikeModel || '-'}</span></td>
+
+                                        <td className="p-3.5 font-mono text-slate-600">{c.phone || '-'} <span className="block text-[10px] text-slate-400">{c.email || '未填寫信箱'}</span></td>
+
+                                        <td className="p-3.5 text-slate-600">{formatDate(c.lastVisit)}</td>
+
+                                        <td className="p-3.5">
+
+                                            <span className={`px-2 py-0.5 rounded-full font-bold text-[11px] ${c.diffDays >= 365 ? 'bg-red-100 text-red-700' : c.diffDays >= 180 ? 'bg-orange-100 text-orange-800' : 'bg-emerald-100 text-emerald-700'}`}>
+
+                                                {c.diffDays} 天
+
+                                            </span>
+
+                                        </td>
+
+                                        <td className="p-3.5 text-center">
+
+                                            <button onClick={() => openReminderEmail(c)} className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-bold inline-flex items-center gap-1">
+
+                                                <Mail size={13}/> 寄送提醒
+
+                                            </button>
+
+                                        </td>
 
                                     </tr>
 
-                                </thead>
+                                ))}
 
-                                <tbody className="divide-y divide-slate-100">
+                                {reminderList.length === 0 && (
 
-                                    {filteredList.map(item => {
+                                    <tr>
 
-                                        const c = item.customer;
+                                        <td colSpan="6" className="p-10 text-center text-slate-400 font-bold">目前無符合此條件之待提醒客戶</td>
 
-                                        const hasEmail = Boolean(c.email && c.email.includes('@'));
+                                    </tr>
 
-                                        const isSending = sendingId === c.id;
+                                )}
+
+                            </tbody>
+
+                        </table>
+
+                    </div>
 
 
 
-                                        return (
+                    {emailModal.open && (
 
-                                            <tr key={c.id || c.plate} className="hover:bg-slate-50/80 transition-colors">
+                        <div className="fixed inset-0 bg-black/75 backdrop-blur-sm flex items-center justify-center z-[9999] p-4">
 
-                                                <td className="p-3.5">
+                            <div className="bg-white w-full max-w-md rounded-2xl p-4 space-y-3">
 
-                                                    <div className="font-mono font-black text-blue-700 text-sm">{c.plate}</div>
+                                <h3 className="font-black text-slate-800 text-sm flex items-center gap-1.5"><Mail size={16} className="text-blue-600"/> 發送定期保養關懷 Email</h3>
 
-                                                    <div className="text-slate-800 font-bold">{c.name || '車主'} {c.phone ? `(${c.phone})` : ''}</div>
+                                <input type="email" value={emailModal.email} onChange={e => setEmailModal({ ...emailModal, email: e.target.value })} placeholder="請輸入客戶 Email 信箱" className="w-full p-2 border border-slate-300 rounded-xl font-mono font-bold"/>
 
-                                                    <div className="text-[11px] text-slate-400">{c.bikeModel || '-'} {c.year ? `(${c.year}年)` : ''}</div>
+                                <input type="text" value={emailModal.subject} onChange={e => setEmailModal({ ...emailModal, subject: e.target.value })} className="w-full p-2 border border-slate-300 rounded-xl font-bold"/>
+
+                                <textarea rows={7} value={emailModal.body} onChange={e => setEmailModal({ ...emailModal, body: e.target.value })} className="w-full p-2 border border-slate-300 rounded-xl font-mono text-[11px]"></textarea>
+
+                                <div className="flex justify-end gap-2">
+
+                                    <button onClick={() => setEmailModal({ open: false, customer: null, email: '', subject: '', body: '' })} className="px-4 py-2 bg-slate-100 rounded-xl font-bold">取消</button>
+
+                                    <button onClick={sendReminder} disabled={isSending} className="px-4 py-2 bg-blue-600 text-white rounded-xl font-bold">
+
+                                        {isSending ? '發送中...' : '確認發送'}
+
+                                    </button>
+
+                                </div>
+
+                            </div>
+
+                        </div>
+
+                    )}
+
+                </div>
+
+            );
+
+        };
+
+
+
+        const SettingsView = ({ tempUrl, setUrl, gasUrl, fetchCloudData, shopInfo, setShopInfo, staffList, setStaffList, staffProfiles, setStaffProfiles, quickServices, setQuickServices, records, setRecords, customers, setCustomers, cashRecords, setCashRecords, testConnection, isLoading, isSavingSettings, saveSettingsToCloud, currentPin, setCurrentPin, showAlert, showConfirm }) => {
+
+            const [activeSection, setActiveSection] = useState('cloud');
+
+            const [newStaffName, setNewStaffName] = useState('');
+
+            const [newStaffRole, setNewStaffRole] = useState('技師');
+
+            const [newService, setNewService] = useState({ name: '', partsPrice: '', laborHours: 0.15, stock: 10, minStock: 5, supplier: '', isBasicMaintenance: true });
+
+            const [newPin, setNewPin] = useState(currentPin || '0511');
+
+            const [showPinText, setShowPinText] = useState(false);
+
+            const [showApiKey, setShowApiKey] = useState(false);
+
+            const [serviceSearch, setServiceSearch] = useState('');
+
+            const logoInputRef = useRef(null);
+
+            const backupFileRef = useRef(null);
+
+
+
+            const isUrlModified = tempUrl && gasUrl && tempUrl.trim() !== gasUrl.trim();
+
+
+
+            const handleLogoUpload = async (e) => {
+
+                const file = e.target.files && e.target.files[0];
+
+                if (file) {
+
+                    const compressed = await compressImage(file);
+
+                    if (compressed) {
+
+                        const updatedShop = { ...shopInfo, logo: compressed };
+
+                        setShopInfo(updatedShop);
+
+                        saveToLocalSafe('moto_shopInfo', updatedShop);
+
+                        saveToLocalSafe('moto_customLogo', compressed);
+
+                        // 上傳後立即將新 Logo 寫入雲端試算表，防止被背景輪詢覆蓋回預設圖示
+                        saveSettingsToCloud(null, true, null, null, null, null, null, null, updatedShop);
+
+                        showAlert('✅ 店鋪專屬 Logo 已更新並自動永久同步至雲端！');
+
+                    }
+
+                }
+
+            };
+
+
+
+            const handleResetLogo = () => {
+
+                showConfirm('確定要將店鋪 Logo 還原為系統預設圖示嗎？', () => {
+
+                    const resetShop = { ...shopInfo, logo: DEFAULT_LOGO };
+
+                    setShopInfo(resetShop);
+
+                    saveToLocalSafe('moto_shopInfo', resetShop);
+
+                    localStorage.removeItem('moto_customLogo');
+
+                    saveSettingsToCloud(null, true, null, null, null, null, null, null, resetShop);
+
+                });
+
+            };
+
+
+
+            const handleAddStaff = () => {
+
+                const trimmed = newStaffName.trim();
+
+                if (!trimmed) return showAlert('請輸入技師姓名');
+
+                if (staffList.includes(trimmed)) return showAlert('此技師已在名單中');
+
+                const preset = STAFF_ROLE_PRESETS[newStaffRole] || STAFF_ROLE_PRESETS['技師'];
+
+                const updatedList = [...staffList, trimmed];
+
+                const updatedProfiles = {
+
+                    ...(staffProfiles || {}),
+
+                    [trimmed]: {
+
+                        role: newStaffRole,
+
+                        years: 1,
+
+                        baseSalary: preset.defaultSalary,
+
+                        laborBonusRate: preset.baseLaborRate + 1,
+
+                        referralBonusRate: preset.baseReferralRate + 0.5
+
+                    }
+
+                };
+
+                setStaffList(updatedList);
+
+                setStaffProfiles(updatedProfiles);
+
+                setNewStaffName('');
+
+                saveSettingsToCloud(null, true, null, updatedProfiles, updatedList);
+
+                showAlert(`✅ 已新增技師【${trimmed} (${preset.title})】並自動同步雲端！`);
+
+            };
+
+
+
+            const handleUpdateStaffRoleInSettings = (name, newRole) => {
+
+                const preset = STAFF_ROLE_PRESETS[newRole] || STAFF_ROLE_PRESETS['技師'];
+
+                const curProf = (staffProfiles && staffProfiles[name]) || DEFAULT_STAFF_PROFILES[name] || { years: 1 };
+
+                const years = Number(curProf.years !== undefined ? curProf.years : 1);
+
+                const seniorityLabor = Math.min(years * 1, 10);
+
+                const seniorityRef = Math.min(years * 0.5, 5);
+
+                const updatedProfiles = {
+
+                    ...(staffProfiles || {}),
+
+                    [name]: {
+
+                        ...curProf,
+
+                        role: newRole,
+
+                        years,
+
+                        baseSalary: preset.defaultSalary,
+
+                        laborBonusRate: preset.baseLaborRate + seniorityLabor,
+
+                        referralBonusRate: preset.baseReferralRate + seniorityRef
+
+                    }
+
+                };
+
+                setStaffProfiles(updatedProfiles);
+
+                saveSettingsToCloud(null, true, null, updatedProfiles, staffList);
+
+            };
+
+
+
+            const handleRemoveStaff = (name) => {
+
+                showConfirm(`確定要從團隊名單中移除「${name}」嗎？`, () => {
+
+                    const updatedList = staffList.filter(s => s !== name);
+
+                    setStaffList(updatedList);
+
+                    saveSettingsToCloud(null, true, null, null, updatedList);
+
+                });
+
+            };
+
+
+
+            const handleAddService = () => {
+
+                if (!newService.name.trim()) return showAlert('請輸入維修項目名稱');
+
+                const item = {
+
+                    id: String(Date.now()),
+
+                    name: newService.name.trim(),
+
+                    partsPrice: cleanNumber(newService.partsPrice, 0),
+
+                    laborHours: cleanNumber(newService.laborHours, 0.1),
+
+                    stock: cleanNumber(newService.stock, 10),
+
+                    minStock: cleanNumber(newService.minStock, 5),
+
+                    supplier: newService.supplier.trim() || '一般材料商',
+
+                    isBasicMaintenance: Boolean(newService.isBasicMaintenance)
+
+                };
+
+                setQuickServices([...quickServices, item]);
+
+                setNewService({ name: '', partsPrice: '', laborHours: 0.15, stock: 10, minStock: 5, supplier: '', isBasicMaintenance: true });
+
+            };
+
+
+
+            const handleUpdateServiceField = (id, field, value) => {
+
+                setQuickServices(prev => prev.map(s => s.id === id ? { ...s, [field]: value } : s));
+
+            };
+
+
+
+            const handleResetDefaultServices = () => {
+
+                showConfirm('確定要載入預設常用標準備料項目嗎？（將會保留您已新增的自訂項目，並補齊預設項目）', () => {
+
+                    const existNames = new Set(quickServices.map(s => s.name));
+
+                    const merged = [...quickServices];
+
+                    DEFAULT_SERVICES.forEach(ds => {
+
+                        if (!existNames.has(ds.name)) merged.push({ ...ds, id: String(Date.now() + Math.random()) });
+
+                    });
+
+                    setQuickServices(merged);
+
+                    showAlert('✅ 已補齊預設常用保養備料項目！');
+
+                });
+
+            };
+
+
+
+            const handleDownloadJsonBackup = () => {
+
+                const backupObj = {
+
+                    version: '3.0.0',
+
+                    exportDate: new Date().toISOString(),
+
+                    shopInfo,
+
+                    quickServices,
+
+                    staffList,
+
+                    staffProfiles,
+
+                    records,
+
+                    customers,
+
+                    cashRecords,
+
+                    adminPin: currentPin
+
+                };
+
+                const blob = new Blob([JSON.stringify(backupObj, null, 2)], { type: 'application/json' });
+
+                const url = URL.createObjectURL(blob);
+
+                const a = document.createElement('a');
+
+                a.href = url;
+
+                a.download = `SourceMoto_Backup_${getLocalDateString(new Date())}.json`;
+
+                a.click();
+
+            };
+
+
+
+            const handleExportAllRecordsCsv = () => {
+
+                const rows = [
+
+                    ['工單編號', '建檔日期', '完工日期', '車牌號碼', '客戶姓名', '聯絡電話', '車種型號', '里程(km)', '狀態', '進度階段', '維修保養內容', '已付定金', '待收尾款', '總金額', '付款方式', '介紹人技師', '備註事項']
+
+                ];
+
+                (records || []).forEach(r => {
+
+                    const items = normalizeItems(r.items);
+
+                    const itemsStr = items.map(it => `${it.name} x${it.qty || 1}`).join('；');
+
+                    rows.push([
+
+                        r.id || '',
+
+                        formatDate(r.date),
+
+                        r.completedDate || '',
+
+                        r.plate || '',
+
+                        r.name || '',
+
+                        r.phone || '',
+
+                        r.bikeModel || '',
+
+                        r.mileage || '',
+
+                        r.status === 'completed' ? '已完工' : '處理中',
+
+                        r.progressStage || '',
+
+                        itemsStr || r.human_items || '',
+
+                        cleanNumber(r.depositAmount, 0),
+
+                        cleanNumber(r.remainingBalance, 0),
+
+                        cleanNumber(r.total, 0),
+
+                        r.paymentMethod || '現金',
+
+                        r.referrerStaff || '',
+
+                        r.notes || ''
+
+                    ]);
+
+                });
+
+                exportToCsv(`全店維修工單總表_${getLocalDateString(new Date())}.csv`, rows);
+
+            };
+
+
+
+            const handleExportAllCustomersCsv = () => {
+
+                const rows = [
+
+                    ['客戶編號', '車牌號碼', '車主姓名', '聯絡電話', '電子郵件', '車種型號', '出廠年份', '最新里程(km)', '最後來店日']
+
+                ];
+
+                (customers || []).forEach(c => {
+
+                    rows.push([
+
+                        c.id || '',
+
+                        c.plate || '',
+
+                        c.name || '',
+
+                        c.phone || '',
+
+                        c.email || '',
+
+                        c.bikeModel || '',
+
+                        c.year || '',
+
+                        c.lastMileage || '',
+
+                        formatDate(c.lastVisit)
+
+                    ]);
+
+                });
+
+                exportToCsv(`全店客戶車籍名冊_${getLocalDateString(new Date())}.csv`, rows);
+
+            };
+
+
+
+            const handleRestoreJsonBackup = (e) => {
+
+                const file = e.target.files && e.target.files[0];
+
+                if (!file) return;
+
+                const reader = new FileReader();
+
+                reader.onload = (ev) => {
+
+                    try {
+
+                        const parsed = JSON.parse(ev.target.result);
+
+                        showConfirm('確定要還原此備份檔嗎？目前的本機資料將被備份檔覆蓋。', () => {
+
+                            if (parsed.shopInfo) setShopInfo(parsed.shopInfo);
+
+                            if (Array.isArray(parsed.quickServices)) setQuickServices(parsed.quickServices);
+
+                            if (Array.isArray(parsed.staffList)) setStaffList(parsed.staffList);
+
+                            if (parsed.staffProfiles) setStaffProfiles(parsed.staffProfiles);
+
+                            if (Array.isArray(parsed.records)) setRecords(parsed.records.map(normalizeRecord));
+
+                            if (Array.isArray(parsed.customers)) setCustomers(parsed.customers);
+
+                            if (Array.isArray(parsed.cashRecords)) setCashRecords(parsed.cashRecords);
+
+                            if (parsed.adminPin) setCurrentPin(String(parsed.adminPin));
+
+                            showAlert('✅ 資料備份檔已成功還原！建議點擊右上角「立即全庫同步至雲端」更新試算表。');
+
+                        });
+
+                    } catch (err) {
+
+                        showAlert('❌ 備份檔格式錯誤，無法還原');
+
+                    }
+
+                };
+
+                reader.readAsText(file);
+
+            };
+
+
+
+            const filteredServices = (quickServices || []).filter(s => {
+
+                if (!serviceSearch) return true;
+
+                const q = serviceSearch.trim().toLowerCase();
+
+                return (s.name && s.name.toLowerCase().includes(q)) || (s.supplier && s.supplier.toLowerCase().includes(q));
+
+            });
+
+
+
+            return (
+
+                <div className="max-w-5xl mx-auto space-y-5 pb-24 text-xs">
+
+                    <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-xs flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
+
+                        <div>
+
+                            <h2 className="text-lg font-black text-slate-800 flex items-center gap-2">
+
+                                <Settings className="text-blue-600" size={22}/> 系統設定與雲端資料庫備份
+
+                            </h2>
+
+                            <p className="text-slate-400 text-xs mt-0.5">管理 Google 試算表雲端連線、門市 Logo 與費率、標準備料、技師名單與本地備份檔</p>
+
+                        </div>
+
+                        <div className="flex flex-wrap gap-2 w-full sm:w-auto">
+
+                            {fetchCloudData && (
+
+                                <button 
+
+                                    type="button" 
+
+                                    onClick={() => fetchCloudData(gasUrl, false)} 
+
+                                    disabled={isLoading}
+
+                                    className="flex-1 sm:flex-none px-3.5 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl font-bold flex items-center justify-center gap-1.5 transition-colors disabled:opacity-50"
+
+                                    title="從 Google 試算表重新拉取最新資料"
+
+                                >
+
+                                    <RefreshCw size={14} className={isLoading ? "animate-spin text-blue-600" : ""}/>
+
+                                    <span>從雲端重新載入</span>
+
+                                </button>
+
+                            )}
+
+                            <button 
+
+                                type="button" 
+
+                                onClick={() => saveSettingsToCloud(null, false)} 
+
+                                disabled={isSavingSettings}
+
+                                className="flex-1 sm:flex-none px-4 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-black flex items-center justify-center gap-2 shadow-sm disabled:opacity-50"
+
+                            >
+
+                                {isSavingSettings ? <RefreshCw size={15} className="animate-spin"/> : <CloudCheck size={15}/>}
+
+                                <span>{isSavingSettings ? '正在同步至雲端...' : '立即全庫同步至雲端'}</span>
+
+                            </button>
+
+                        </div>
+
+                    </div>
+
+
+
+                    <div className="flex flex-wrap gap-2 bg-white p-2 rounded-2xl border border-slate-200">
+
+                        {[
+
+                            { id: 'cloud', label: '☁️ 雲端與安全 PIN' },
+
+                            { id: 'shop', label: '🏪 門市資訊與費率' },
+
+                            { id: 'services', label: `🔧 標準備料項目 (${quickServices.length})` },
+
+                            { id: 'staff', label: `👨‍🔧 技師團隊名冊 (${staffList.length})` },
+
+                            { id: 'backup', label: '💾 實體備份與匯出' }
+
+                        ].map(tab => (
+
+                            <button 
+
+                                key={tab.id} 
+
+                                onClick={() => setActiveSection(tab.id)}
+
+                                className={`px-3.5 py-2 rounded-xl font-bold transition-all ${activeSection === tab.id ? 'bg-slate-900 text-white shadow-xs' : 'text-slate-600 hover:bg-slate-100'}`}
+
+                            >
+
+                                {tab.label}
+
+                            </button>
+
+                        ))}
+
+                    </div>
+
+
+
+                    {activeSection === 'cloud' && (
+
+                        <div className="bg-white p-5 rounded-2xl border border-slate-200 space-y-5">
+
+                            <div className="bg-slate-50 p-4 rounded-xl border border-slate-200 space-y-3">
+
+                                <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2">
+
+                                    <div>
+
+                                        <label className="font-black text-slate-800 text-sm flex items-center gap-1.5">
+
+                                            <Cloud size={18} className="text-blue-600"/> Google Apps Script 雲端同步網址 (/exec)
+
+                                        </label>
+
+                                        <p className="text-[11px] text-slate-500 mt-0.5">貼上部署後的 Web App 網址並點選「儲存並測試雲端連線」即可綁定試算表</p>
+
+                                    </div>
+
+                                    <button
+
+                                        type="button"
+
+                                        onClick={() => {
+
+                                            setUrl(DEFAULT_GAS_URL);
+
+                                            testConnection(DEFAULT_GAS_URL);
+
+                                        }}
+
+                                        className="px-2.5 py-1 bg-white hover:bg-slate-100 text-slate-600 border border-slate-300 rounded-lg font-bold text-[11px] shrink-0"
+
+                                    >
+
+                                        還原預設同步網址
+
+                                    </button>
+
+                                </div>
+
+
+
+                                <div className="flex flex-col sm:flex-row gap-2">
+
+                                    <input 
+
+                                        type="text" 
+
+                                        value={tempUrl || ''} 
+
+                                        onChange={e => setUrl(e.target.value)} 
+
+                                        placeholder="https://script.google.com/macros/s/.../exec"
+
+                                        className="flex-1 p-2.5 border border-slate-300 rounded-xl font-mono text-xs bg-white outline-none focus:border-blue-500"
+
+                                    />
+
+                                    <button 
+
+                                        type="button" 
+
+                                        onClick={() => testConnection(tempUrl)} 
+
+                                        disabled={isLoading}
+
+                                        className="px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-bold flex items-center justify-center gap-1.5 shrink-0 shadow-xs"
+
+                                    >
+
+                                        {isLoading ? <RefreshCw size={14} className="animate-spin"/> : <CloudCheck size={15}/>}
+
+                                        <span>儲存並測試雲端連線</span>
+
+                                    </button>
+
+                                </div>
+
+
+
+                                {isUrlModified && (
+
+                                    <div className="p-2.5 bg-amber-50 border border-amber-300 rounded-lg text-amber-800 font-bold text-[11px] flex items-center gap-1.5">
+
+                                        <AlertTriangle size={15} className="text-amber-600 shrink-0"/>
+
+                                        <span>您已修改輸入框中的網址，請務必點擊右側「儲存並測試雲端連線」才會正式套用生效！</span>
+
+                                    </div>
+
+                                )}
+
+
+
+                                <div className="text-[11px] text-slate-500 flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-slate-200/80">
+
+                                    <span className="font-mono truncate max-w-xl">目前生效網址：{gasUrl || '未設定'}</span>
+
+                                    <span className="text-emerald-700 font-bold">目前載入：{records.length} 筆工單 / {customers.length} 位客戶</span>
+
+                                </div>
+
+                            </div>
+
+
+
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-2">
+
+                                <div className="bg-slate-50 p-4 rounded-xl border border-slate-200 space-y-2">
+
+                                    <label className="font-bold text-slate-800 text-sm flex items-center gap-1.5">
+
+                                        <Lock size={16} className="text-amber-600"/> 主管授權 4 位數 PIN 碼
+
+                                    </label>
+
+                                    <p className="text-[11px] text-slate-500">用於解鎖「老闆模式」、查看歷史營業額、客戶車籍庫、人事績效與抽成開關</p>
+
+                                    <div className="flex gap-2 pt-1">
+
+                                        <input 
+
+                                            type={showPinText ? "text" : "password"} 
+
+                                            maxLength={4}
+
+                                            value={newPin} 
+
+                                            onChange={e => setNewPin(e.target.value.replace(/\D/g, ''))} 
+
+                                            className="w-28 p-2 border border-slate-300 rounded-xl font-mono font-black text-center text-sm bg-white outline-none focus:border-blue-500"
+
+                                        />
+
+                                        <button type="button" onClick={() => setShowPinText(!showPinText)} className="px-3 py-2 bg-white border border-slate-300 hover:bg-slate-100 rounded-xl font-bold text-slate-600">
+
+                                            {showPinText ? '隱藏' : '顯示'}
+
+                                        </button>
+
+                                        <button 
+
+                                            type="button" 
+
+                                            onClick={() => {
+
+                                                if (newPin.length !== 4) return showAlert('PIN 碼須為 4 位數字');
+
+                                                setCurrentPin(newPin);
+
+                                                localStorage.setItem('moto_adminPin', newPin);
+
+                                                saveSettingsToCloud(null, false, newPin);
+
+                                            }}
+
+                                            className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-xl font-bold shadow-xs"
+
+                                        >
+
+                                            更新並同步密碼
+
+                                        </button>
+
+                                    </div>
+
+                                </div>
+
+
+
+                                <div className="bg-slate-50 p-4 rounded-xl border border-slate-200 space-y-2">
+
+                                    <label className="font-bold text-slate-800 text-sm flex items-center gap-1.5">
+
+                                        <Sparkle size={16} className="text-indigo-600"/> Google Gemini API Key (AI 智慧報價用)
+
+                                    </label>
+
+                                    <p className="text-[11px] text-slate-500">用於「雲端報價 & 備料」中的 LINE 對話智慧解析（留空則使用系統預設環境或本機解析）</p>
+
+                                    <div className="flex gap-2 pt-1">
+
+                                        <input 
+
+                                            type={showApiKey ? "text" : "password"} 
+
+                                            value={shopInfo.geminiApiKey || ''} 
+
+                                            onChange={e => setShopInfo({ ...shopInfo, geminiApiKey: e.target.value })} 
+
+                                            placeholder="AIzaSy... (選填，留空即使用系統預設憑證)"
+
+                                            className="flex-1 p-2 border border-slate-300 rounded-xl font-mono bg-white outline-none focus:border-blue-500"
+
+                                        />
+
+                                        <button type="button" onClick={() => setShowApiKey(!showApiKey)} className="px-3 py-2 bg-white border border-slate-300 hover:bg-slate-100 rounded-xl font-bold text-slate-600">
+
+                                            {showApiKey ? '隱藏' : '顯示'}
+
+                                        </button>
+
+                                    </div>
+
+                                </div>
+
+                            </div>
+
+                        </div>
+
+                    )}
+
+
+
+                    {activeSection === 'shop' && (
+
+                        <div className="bg-white p-5 rounded-2xl border border-slate-200 space-y-5">
+
+                            {/* 店鋪 Logo 設定區塊 */}
+
+                            <div className="bg-slate-50 p-4 rounded-xl border border-slate-200 flex flex-col sm:flex-row items-center justify-between gap-4">
+
+                                <div className="flex items-center gap-4">
+
+                                    <div className="w-28 h-16 bg-white border border-slate-300 rounded-xl flex items-center justify-center overflow-hidden p-1.5 shadow-2xs shrink-0">
+
+                                        {shopInfo.logo ? (
+
+                                            <img src={shopInfo.logo} alt="Shop Logo" className="w-full h-full object-contain" />
+
+                                        ) : (
+
+                                            <Bike size={32} className="text-slate-400" />
+
+                                        )}
+
+                                    </div>
+
+                                    <div>
+
+                                        <h3 className="font-black text-slate-800 text-sm">門市專屬商標 (Logo)</h3>
+
+                                        <p className="text-[11px] text-slate-500 mt-0.5">顯示於左上角導覽列與列印出的正式維修收據頂部（系統會自動最佳化壓縮圖片）</p>
+
+                                    </div>
+
+                                </div>
+
+                                <div className="flex gap-2 w-full sm:w-auto">
+
+                                    <button 
+
+                                        type="button" 
+
+                                        onClick={() => logoInputRef.current && logoInputRef.current.click()}
+
+                                        className="flex-1 sm:flex-none px-3.5 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-bold flex items-center justify-center gap-1.5 shadow-xs"
+
+                                    >
+
+                                        <Camera size={15}/> 上傳新 Logo
+
+                                    </button>
+
+                                    <button 
+
+                                        type="button" 
+
+                                        onClick={handleResetLogo}
+
+                                        className="px-3 py-2 bg-white border border-slate-300 hover:bg-slate-100 text-slate-600 rounded-xl font-bold"
+
+                                    >
+
+                                        預設圖示
+
+                                    </button>
+
+                                    <input ref={logoInputRef} type="file" accept="image/*" className="hidden" onChange={handleLogoUpload} />
+
+                                </div>
+
+                            </div>
+
+
+
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+
+                                <div>
+
+                                    <label className="font-bold text-slate-600 block mb-1">車行名稱</label>
+
+                                    <input type="text" value={shopInfo.name || ''} onChange={e => setShopInfo({ ...shopInfo, name: e.target.value })} className="w-full p-2.5 border border-slate-300 rounded-xl font-bold outline-none focus:border-blue-500"/>
+
+                                </div>
+
+                                <div>
+
+                                    <label className="font-bold text-slate-600 block mb-1">聯絡電話</label>
+
+                                    <input type="text" value={shopInfo.phone || ''} onChange={e => setShopInfo({ ...shopInfo, phone: e.target.value })} className="w-full p-2.5 border border-slate-300 rounded-xl font-bold outline-none focus:border-blue-500"/>
+
+                                </div>
+
+                                <div>
+
+                                    <label className="font-bold text-slate-600 block mb-1">門市地址</label>
+
+                                    <input type="text" value={shopInfo.address || ''} onChange={e => setShopInfo({ ...shopInfo, address: e.target.value })} className="w-full p-2.5 border border-slate-300 rounded-xl outline-none focus:border-blue-500"/>
+
+                                </div>
+
+                                <div>
+
+                                    <label className="font-bold text-slate-600 block mb-1">統一編號</label>
+
+                                    <input type="text" value={shopInfo.taxId || ''} onChange={e => setShopInfo({ ...shopInfo, taxId: e.target.value })} className="w-full p-2.5 border border-slate-300 rounded-xl font-mono outline-none focus:border-blue-500"/>
+
+                                </div>
+
+                                <div className="bg-blue-50/60 p-3.5 rounded-xl border border-blue-200">
+
+                                    <label className="font-black text-blue-950 block mb-1">標準工資時薪率 ($/hr)</label>
+
+                                    <input type="number" value={shopInfo.hourlyRate || 800} onChange={e => setShopInfo({ ...shopInfo, hourlyRate: cleanNumber(e.target.value, 800) })} className="w-full p-2 border border-blue-300 rounded-lg font-mono font-black text-blue-700 bg-white outline-none"/>
+
+                                    <span className="text-[10px] text-blue-600 mt-1 block">開單時各項目的「工時 × 時薪率」即為單項工資</span>
+
+                                </div>
+
+                                <div className="bg-indigo-50/60 p-3.5 rounded-xl border border-indigo-200">
+
+                                    <label className="font-black text-indigo-950 block mb-1">預設介紹人零件抽成率 (%)</label>
+
+                                    <input type="number" value={shopInfo.referrerCommissionRate || 20} onChange={e => setShopInfo({ ...shopInfo, referrerCommissionRate: cleanNumber(e.target.value, 20) })} className="w-full p-2 border border-indigo-300 rounded-lg font-mono font-black text-indigo-700 bg-white outline-none"/>
+
+                                    <span className="text-[10px] text-indigo-600 mt-1 block">勾選提撥零件抽成時的預設計算百分比（基礎保養耗材自動免抽成）</span>
+
+                                </div>
+
+                                <div className="sm:col-span-2">
+
+                                    <label className="font-bold text-slate-600 block mb-1">收據底部感謝與保養叮嚀備註</label>
+
+                                    <input type="text" value={shopInfo.note || ''} onChange={e => setShopInfo({ ...shopInfo, note: e.target.value })} className="w-full p-2.5 border border-slate-300 rounded-xl outline-none focus:border-blue-500"/>
+
+                                </div>
+
+                            </div>
+
+                        </div>
+
+                    )}
+
+
+
+                    {activeSection === 'services' && (
+
+                        <div className="bg-white p-5 rounded-2xl border border-slate-200 space-y-4">
+
+                            <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2 border-b border-slate-100 pb-3">
+
+                                <div>
+
+                                    <h3 className="font-black text-slate-800 text-sm">常用標準備料、標準工時與安全水位設定</h3>
+
+                                    <p className="text-[11px] text-slate-400">可直接在下方表格修改各項目的單價、標準工時、庫存、安全水位與「基礎保養(免抽成)」屬性</p>
+
+                                </div>
+
+                                <div className="flex gap-2 w-full sm:w-auto">
+
+                                    <input 
+
+                                        type="text" 
+
+                                        placeholder="搜尋品項或廠商..." 
+
+                                        value={serviceSearch} 
+
+                                        onChange={e => setServiceSearch(e.target.value)} 
+
+                                        className="flex-1 sm:w-44 p-1.5 border border-slate-300 rounded-lg text-xs outline-none focus:border-blue-500"
+
+                                    />
+
+                                    <button 
+
+                                        type="button" 
+
+                                        onClick={handleResetDefaultServices}
+
+                                        className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg font-bold text-[11px] shrink-0"
+
+                                    >
+
+                                        + 補齊預設項目
+
+                                    </button>
+
+                                </div>
+
+                            </div>
+
+
+
+                            {/* 新增標準備料完整表單 */}
+
+                            <div className="bg-blue-50/50 p-3.5 rounded-xl border border-blue-200 space-y-2.5">
+
+                                <span className="font-bold text-blue-900 text-xs block">➕ 新增常用備料 / 保養項目：</span>
+
+                                <div className="grid grid-cols-2 sm:grid-cols-7 gap-2 items-end">
+
+                                    <div className="col-span-2">
+
+                                        <label className="text-[10px] font-bold text-slate-500 block mb-0.5">零件/服務名稱 *</label>
+
+                                        <input type="text" placeholder="例: 更換機油 Motul 7100" value={newService.name} onChange={e => setNewService({ ...newService, name: e.target.value })} className="w-full p-2 border border-slate-300 rounded-lg bg-white font-bold"/>
+
+                                    </div>
+
+                                    <div>
+
+                                        <label className="text-[10px] font-bold text-slate-500 block mb-0.5">零件單價($)</label>
+
+                                        <input type="number" placeholder="0" value={newService.partsPrice} onChange={e => setNewService({ ...newService, partsPrice: e.target.value })} className="w-full p-2 border border-slate-300 rounded-lg bg-white font-mono text-right"/>
+
+                                    </div>
+
+                                    <div>
+
+                                        <label className="text-[10px] font-bold text-slate-500 block mb-0.5">標準工時(h)</label>
+
+                                        <input type="number" step="0.05" placeholder="0.15" value={newService.laborHours} onChange={e => setNewService({ ...newService, laborHours: e.target.value })} className="w-full p-2 border border-slate-300 rounded-lg bg-white font-mono text-right"/>
+
+                                    </div>
+
+                                    <div>
+
+                                        <label className="text-[10px] font-bold text-slate-500 block mb-0.5">初始庫存 / 安全水位</label>
+
+                                        <div className="flex gap-1">
+
+                                            <input type="number" placeholder="存量" value={newService.stock} onChange={e => setNewService({ ...newService, stock: e.target.value })} title="初始庫存" className="w-1/2 p-2 border border-slate-300 rounded-lg bg-white font-mono text-center"/>
+
+                                            <input type="number" placeholder="警戒" value={newService.minStock} onChange={e => setNewService({ ...newService, minStock: e.target.value })} title="安全警戒水位" className="w-1/2 p-2 border border-slate-300 rounded-lg bg-white font-mono text-center"/>
+
+                                        </div>
+
+                                    </div>
+
+                                    <div>
+
+                                        <label className="text-[10px] font-bold text-slate-500 block mb-0.5">供料廠商</label>
+
+                                        <input type="text" placeholder="例: 摩特潤滑油" value={newService.supplier} onChange={e => setNewService({ ...newService, supplier: e.target.value })} className="w-full p-2 border border-slate-300 rounded-lg bg-white"/>
+
+                                    </div>
+
+                                    <div className="flex flex-col gap-1">
+
+                                        <label className="flex items-center gap-1 cursor-pointer text-[10px] font-bold text-amber-900 select-none">
+
+                                            <input type="checkbox" checked={Boolean(newService.isBasicMaintenance)} onChange={e => setNewService({ ...newService, isBasicMaintenance: e.target.checked })} className="rounded text-amber-600 accent-amber-600"/>
+
+                                            <span>基礎保養(免抽成)</span>
+
+                                        </label>
+
+                                        <button type="button" onClick={handleAddService} className="w-full bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-bold py-2 shadow-2xs">+ 新增品項</button>
+
+                                    </div>
+
+                                </div>
+
+                            </div>
+
+
+
+                            {/* 標準備料行內編輯表格 */}
+
+                            <div className="overflow-x-auto border border-slate-200 rounded-xl">
+
+                                <table className="w-full text-left text-xs min-w-[780px]">
+
+                                    <thead>
+
+                                        <tr className="bg-slate-50 border-b border-slate-200 text-slate-600 font-bold">
+
+                                            <th className="p-2.5">品項名稱</th>
+
+                                            <th className="p-2.5 w-24 text-right">零件費($)</th>
+
+                                            <th className="p-2.5 w-20 text-right">工時(h)</th>
+
+                                            <th className="p-2.5 w-20 text-center">目前庫存</th>
+
+                                            <th className="p-2.5 w-20 text-center">安全水位</th>
+
+                                            <th className="p-2.5 w-32">供料廠商</th>
+
+                                            <th className="p-2.5 w-32 text-center">抽成屬性</th>
+
+                                            <th className="p-2.5 w-14 text-center">刪除</th>
+
+                                        </tr>
+
+                                    </thead>
+
+                                    <tbody className="divide-y divide-slate-100">
+
+                                        {filteredServices.map(s => (
+
+                                            <tr key={s.id} className="hover:bg-slate-50/70">
+
+                                                <td className="p-2">
+
+                                                    <input type="text" value={s.name || ''} onChange={e => handleUpdateServiceField(s.id, 'name', e.target.value)} className="w-full p-1.5 border border-slate-200 focus:border-blue-500 rounded-lg font-bold text-slate-800 outline-none bg-white"/>
 
                                                 </td>
 
-                                                <td className="p-3.5">
+                                                <td className="p-2">
 
-                                                    <div className="font-medium text-slate-700">{formatDate(item.lastDate)}</div>
-
-                                                    <div className="text-[11px] text-slate-500">距今約 <strong className="text-slate-800 font-mono">{item.daysSince}</strong> 天</div>
-
-                                                    <div className="text-[10px] text-slate-400 font-mono">上次里程: {c.lastMileage ? `${c.lastMileage} km` : '-'}</div>
+                                                    <input type="number" value={s.partsPrice !== undefined ? s.partsPrice : (s.price || 0)} onChange={e => handleUpdateServiceField(s.id, 'partsPrice', cleanNumber(e.target.value, 0))} className="w-full p-1.5 border border-slate-200 focus:border-blue-500 rounded-lg font-mono text-right font-bold outline-none bg-white"/>
 
                                                 </td>
 
-                                                <td className="p-3.5 space-y-1">
+                                                <td className="p-2">
 
-                                                    <div className="flex flex-wrap gap-1">
-
-                                                        {item.isOilDue && (
-
-                                                            <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-900 border border-amber-300">
-
-                                                                🛢️ 機油/定期里程建議更換
-
-                                                            </span>
-
-                                                        )}
-
-                                                        {item.hasSafetyIssue && (
-
-                                                            <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-red-100 text-red-900 border border-red-300">
-
-                                                                ⚠️ 健檢項目異常需複檢
-
-                                                            </span>
-
-                                                        )}
-
-                                                        {!item.isOilDue && !item.hasSafetyIssue && (
-
-                                                            <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-300">
-
-                                                                ✓ 目前車況正常
-
-                                                            </span>
-
-                                                        )}
-
-                                                    </div>
-
-                                                    <div className="text-[10px] text-slate-400">
-
-                                                        輪胎:{item.inspection.tires || '良好'} | 煞車:{item.inspection.brakes || '良好'} | 皮帶:{item.inspection.belt || '良好'} | 電瓶:{item.inspection.battery || '12.8V'}
-
-                                                    </div>
+                                                    <input type="number" step="0.05" value={s.laborHours !== undefined ? s.laborHours : 0} onChange={e => handleUpdateServiceField(s.id, 'laborHours', cleanNumber(e.target.value, 0))} className="w-full p-1.5 border border-slate-200 focus:border-blue-500 rounded-lg font-mono text-right outline-none bg-white"/>
 
                                                 </td>
 
-                                                <td className="p-3.5 text-center">
+                                                <td className="p-2">
 
-                                                    <button 
+                                                    <input type="number" value={s.stock !== undefined ? s.stock : 0} onChange={e => handleUpdateServiceField(s.id, 'stock', cleanNumber(e.target.value, 0))} className="w-full p-1.5 border border-slate-200 focus:border-blue-500 rounded-lg font-mono text-center font-bold outline-none bg-white"/>
 
-                                                        type="button" 
+                                                </td>
 
-                                                        onClick={() => handleOpenEmailModal(item)}
+                                                <td className="p-2">
 
-                                                        disabled={isSending}
+                                                    <input type="number" value={s.minStock !== undefined ? s.minStock : 5} onChange={e => handleUpdateServiceField(s.id, 'minStock', cleanNumber(e.target.value, 5))} className="w-full p-1.5 border border-slate-200 focus:border-blue-500 rounded-lg font-mono text-center text-slate-500 outline-none bg-white"/>
 
-                                                        className={`px-3 py-1.5 rounded-xl font-bold text-xs flex items-center justify-center gap-1.5 mx-auto transition-all shadow-2xs active:scale-95 disabled:opacity-50 ${
+                                                </td>
 
-                                                            hasEmail 
+                                                <td className="p-2">
 
-                                                                ? 'bg-blue-600 hover:bg-blue-700 text-white' 
+                                                    <input type="text" value={s.supplier || ''} onChange={e => handleUpdateServiceField(s.id, 'supplier', e.target.value)} placeholder="未指定" className="w-full p-1.5 border border-slate-200 focus:border-blue-500 rounded-lg text-slate-600 outline-none bg-white"/>
 
-                                                                : 'bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-300'
+                                                </td>
+
+                                                <td className="p-2 text-center">
+
+                                                    <button
+
+                                                        type="button"
+
+                                                        onClick={() => handleUpdateServiceField(s.id, 'isBasicMaintenance', !(s.isBasicMaintenance !== undefined ? s.isBasicMaintenance : true))}
+
+                                                        className={`px-2 py-1 rounded-lg font-bold text-[10px] border transition-all ${
+
+                                                            (s.isBasicMaintenance !== undefined ? s.isBasicMaintenance : true)
+
+                                                                ? 'bg-amber-50 text-amber-900 border-amber-300'
+
+                                                                : 'bg-indigo-600 text-white border-indigo-600'
 
                                                         }`}
 
-                                                        title={hasEmail ? `寄送提醒至 ${c.email}` : '尚未留存 Email，點擊可補填並發送'}
-
                                                     >
 
-                                                        {isSending ? <RefreshCw size={13} className="animate-spin" /> : <Mail size={13} />}
-
-                                                        <span>{hasEmail ? '發送 Email' : '補填信箱發送'}</span>
+                                                        {(s.isBasicMaintenance !== undefined ? s.isBasicMaintenance : true) ? '🛡️ 免抽成' : '⚙️ 計抽成'}
 
                                                     </button>
 
-                                                    {c.email ? (
+                                                </td>
 
-                                                        <div className="text-[10px] text-slate-400 truncate max-w-[130px] mx-auto mt-1 font-mono" title={c.email}>
+                                                <td className="p-2 text-center">
 
-                                                            {c.email}
-
-                                                        </div>
-
-                                                    ) : (
-
-                                                        <div className="text-[10px] text-amber-600 font-bold mt-1">未留 Email</div>
-
-                                                    )}
+                                                    <button type="button" onClick={() => setQuickServices(quickServices.filter(x => x.id !== s.id))} className="text-red-500 hover:bg-red-50 p-1.5 rounded-lg"><Trash2 size={15}/></button>
 
                                                 </td>
 
                                             </tr>
 
-                                        );
+                                        ))}
 
-                                    })}
+                                    </tbody>
 
-                                    {filteredList.length === 0 && (
+                                </table>
 
-                                        <tr>
-
-                                            <td colSpan="4" className="p-12 text-center text-slate-400 font-bold">
-
-                                                查無符合篩選條件的車主保養提醒紀錄
-
-                                            </td>
-
-                                        </tr>
-
-                                    )}
-
-                                </tbody>
-
-                            </table>
+                            </div>
 
                         </div>
 
-                    </div>
+                    )}
 
 
 
-                    {/* Email 預覽與自訂發送彈窗 */}
+                    {activeSection === 'staff' && (
 
-                    {emailModal.isOpen && (
+                        <div className="bg-white p-5 rounded-2xl border border-slate-200 space-y-4">
 
-                        <div className="fixed inset-0 bg-black/75 backdrop-blur-sm flex items-center justify-center z-[9999] p-4">
+                            <div className="flex flex-col sm:flex-row gap-2 bg-slate-50 p-3.5 rounded-xl border border-slate-200">
 
-                            <div className="bg-white w-full max-w-lg rounded-2xl shadow-2xl flex flex-col max-h-[90vh] overflow-hidden animate-in zoom-in-95">
+                                <input type="text" placeholder="輸入新技師姓名 (例: 阿瑋)" value={newStaffName} onChange={e => setNewStaffName(e.target.value)} className="flex-1 p-2.5 border border-slate-300 rounded-xl font-bold bg-white outline-none focus:border-blue-500"/>
 
-                                <div className="bg-slate-900 text-white p-4 flex justify-between items-center">
+                                <select value={newStaffRole} onChange={e => setNewStaffRole(e.target.value)} className="p-2.5 border border-slate-300 rounded-xl font-bold bg-white outline-none">
 
-                                    <div className="flex items-center gap-2">
+                                    {Object.keys(STAFF_ROLE_PRESETS).map(r => <option key={r} value={r}>{STAFF_ROLE_PRESETS[r].title} (底薪 ${STAFF_ROLE_PRESETS[r].defaultSalary.toLocaleString()})</option>)}
 
-                                        <Mail size={18} className="text-blue-400"/>
+                                </select>
 
-                                        <h3 className="font-bold text-sm">寄送車主保養提醒信件</h3>
+                                <button type="button" onClick={handleAddStaff} className="px-5 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-bold shadow-xs">+ 新增技師</button>
 
-                                    </div>
+                            </div>
 
-                                    <button 
 
-                                        type="button" 
 
-                                        onClick={() => setEmailModal({ isOpen: false, customer: null, email: '', subject: '', content: '' })} 
+                            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
 
-                                        className="p-1 hover:bg-slate-800 rounded-lg text-slate-300"
+                                {staffList.map(st => {
 
-                                    >
+                                    const prof = (staffProfiles && staffProfiles[st]) || DEFAULT_STAFF_PROFILES[st] || { role: '技師', years: 1, baseSalary: 35000, laborBonusRate: 21, referralBonusRate: 15.5 };
 
-                                        <X size={18}/>
+                                    const preset = STAFF_ROLE_PRESETS[prof.role] || STAFF_ROLE_PRESETS['技師'];
+
+                                    return (
+
+                                        <div key={st} className="p-4 border border-slate-200 rounded-2xl bg-slate-50/70 space-y-2.5 flex flex-col justify-between">
+
+                                            <div className="flex justify-between items-start">
+
+                                                <div className="flex items-center gap-2.5">
+
+                                                    <div className="w-9 h-9 rounded-xl bg-blue-600 text-white font-black flex items-center justify-center text-sm">
+
+                                                        {st.substring(0, 1)}
+
+                                                    </div>
+
+                                                    <div>
+
+                                                        <div className="font-black text-slate-900 text-sm">{st}</div>
+
+                                                        <div className="text-[10px] text-slate-500 font-mono">在職年資: {prof.years || 1} 年</div>
+
+                                                    </div>
+
+                                                </div>
+
+                                                <button type="button" onClick={() => handleRemoveStaff(st)} className="text-slate-400 hover:text-red-600 hover:bg-red-50 p-1.5 rounded-lg transition-colors" title="移除技師"><Trash2 size={15}/></button>
+
+                                            </div>
+
+
+
+                                            <div className="pt-2 border-t border-slate-200/80 flex items-center justify-between gap-2">
+
+                                                <span className="text-[11px] font-bold text-slate-500">目前職級：</span>
+
+                                                <select
+
+                                                    value={prof.role || '技師'}
+
+                                                    onChange={e => handleUpdateStaffRoleInSettings(st, e.target.value)}
+
+                                                    className={`text-xs font-black rounded-lg px-2.5 py-1 border outline-none cursor-pointer ${preset.badgeClass}`}
+
+                                                >
+
+                                                    {Object.keys(STAFF_ROLE_PRESETS).map(r => (
+
+                                                        <option key={r} value={r}>{STAFF_ROLE_PRESETS[r].title}</option>
+
+                                                    ))}
+
+                                                </select>
+
+                                            </div>
+
+
+
+                                            <div className="grid grid-cols-3 gap-1.5 text-center bg-white p-2 rounded-xl border border-slate-200/80 text-[10px]">
+
+                                                <div>
+
+                                                    <span className="text-slate-400 block">標準底薪</span>
+
+                                                    <strong className="font-mono text-slate-800">${Number(prof.baseSalary || preset.defaultSalary).toLocaleString()}</strong>
+
+                                                </div>
+
+                                                <div>
+
+                                                    <span className="text-slate-400 block">工資提撥</span>
+
+                                                    <strong className="font-mono text-emerald-600">{prof.laborBonusRate ?? preset.baseLaborRate}%</strong>
+
+                                                </div>
+
+                                                <div>
+
+                                                    <span className="text-slate-400 block">零件抽成</span>
+
+                                                    <strong className="font-mono text-indigo-600">{prof.referralBonusRate ?? preset.baseReferralRate}%</strong>
+
+                                                </div>
+
+                                            </div>
+
+                                        </div>
+
+                                    );
+
+                                })}
+
+                            </div>
+
+                        </div>
+
+                    )}
+
+
+
+                    {activeSection === 'backup' && (
+
+                        <div className="bg-white p-5 rounded-2xl border border-slate-200 space-y-5">
+
+                            <div className="space-y-2">
+
+                                <h3 className="font-black text-slate-800 text-sm">📦 系統完整資料庫備份與還原 (.json)</h3>
+
+                                <p className="text-[11px] text-slate-500">將全店工單、客戶車籍、公庫對帳、標準備料與五階人事設定完整打包下載保存，或從備份檔還原</p>
+
+                                <div className="flex flex-col sm:flex-row gap-3 pt-1">
+
+                                    <button type="button" onClick={handleDownloadJsonBackup} className="flex-1 py-3 bg-slate-900 hover:bg-slate-800 text-white rounded-xl font-bold flex items-center justify-center gap-2 shadow-xs">
+
+                                        <DownloadSimple size={18}/> 下載完整系統備份檔 (.json)
 
                                     </button>
 
-                                </div>
+                                    <button type="button" onClick={() => backupFileRef.current.click()} className="flex-1 py-3 bg-amber-500 hover:bg-amber-600 text-white rounded-xl font-bold flex items-center justify-center gap-2 shadow-xs">
 
-
-
-                                <div className="p-4 overflow-y-auto flex-1 space-y-3">
-
-                                    <div>
-
-                                        <label className="text-[11px] font-bold text-slate-600 block mb-1">車主收件電子信箱 (Email) *</label>
-
-                                        <input 
-
-                                            type="email" 
-
-                                            value={emailModal.email} 
-
-                                            onChange={e => setEmailModal({ ...emailModal, email: e.target.value })} 
-
-                                            placeholder="例: customer@example.com" 
-
-                                            className="w-full p-2 border border-slate-300 rounded-xl font-mono text-xs outline-none focus:border-blue-500 bg-yellow-50/60 font-bold" 
-
-                                            required 
-
-                                        />
-
-                                        <span className="text-[10px] text-slate-400 mt-0.5 block">若此客戶無信箱或修改信箱，寄出後將自動更新保存於車籍資料庫中</span>
-
-                                    </div>
-
-
-
-                                    <div>
-
-                                        <label className="text-[11px] font-bold text-slate-600 block mb-1">信件主旨</label>
-
-                                        <input 
-
-                                            type="text" 
-
-                                            value={emailModal.subject} 
-
-                                            onChange={e => setEmailModal({ ...emailModal, subject: e.target.value })} 
-
-                                            className="w-full p-2 border border-slate-300 rounded-xl text-xs font-bold outline-none focus:border-blue-500" 
-
-                                        />
-
-                                    </div>
-
-
-
-                                    <div>
-
-                                        <label className="text-[11px] font-bold text-slate-600 block mb-1">信件預覽內容 (可自由編輯微調)</label>
-
-                                        <textarea 
-
-                                            rows="9" 
-
-                                            value={emailModal.content} 
-
-                                            onChange={e => setEmailModal({ ...emailModal, content: e.target.value })} 
-
-                                            className="w-full p-2.5 border border-slate-300 rounded-xl text-xs leading-relaxed outline-none focus:border-blue-500 font-mono" 
-
-                                        ></textarea>
-
-                                    </div>
-
-                                </div>
-
-
-
-                                <div className="p-3.5 bg-slate-50 border-t border-slate-200 flex justify-end gap-2">
-
-                                    <button 
-
-                                        type="button" 
-
-                                        onClick={() => setEmailModal({ isOpen: false, customer: null, email: '', subject: '', content: '' })} 
-
-                                        className="px-4 py-2 bg-white border border-slate-300 hover:bg-slate-100 text-slate-700 rounded-xl font-bold"
-
-                                    >
-
-                                        取消
+                                        <UploadSimple size={18}/> 匯入還原系統備份檔 (.json)
 
                                     </button>
 
-                                    <button 
+                                    <input ref={backupFileRef} type="file" accept=".json" className="hidden" onChange={handleRestoreJsonBackup}/>
 
-                                        type="button" 
+                                </div>
 
-                                        onClick={handleSendEmail} 
+                            </div>
 
-                                        disabled={Boolean(sendingId)}
 
-                                        className="px-5 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-bold flex items-center gap-1.5 shadow-xs transition-all active:scale-95 disabled:opacity-50"
 
-                                    >
+                            <div className="border-t border-slate-200 pt-4 space-y-2">
 
-                                        {sendingId ? <RefreshCw size={14} className="animate-spin" /> : <Mail size={14} />}
+                                <h3 className="font-black text-slate-800 text-sm">📊 匯出 Excel 相容報表 (.csv)</h3>
 
-                                        <span>{sendingId ? '傳送中...' : '確認寄出提醒信件'}</span>
+                                <p className="text-[11px] text-slate-500">可隨時將全店歷年工單或客戶車籍匯出為 Excel 可直接開啟的 CSV 檔案留存</p>
+
+                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+
+                                    <button type="button" onClick={handleExportAllRecordsCsv} className="py-2.5 px-4 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-bold flex items-center justify-center gap-2 shadow-xs">
+
+                                        <FileCsv size={18}/> 匯出全店維修工單總表 CSV ({records.length} 筆)
+
+                                    </button>
+
+                                    <button type="button" onClick={handleExportAllCustomersCsv} className="py-2.5 px-4 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-bold flex items-center justify-center gap-2 shadow-xs">
+
+                                        <FileCsv size={18}/> 匯出全店客戶車籍名冊 CSV ({customers.length} 位)
 
                                     </button>
 
@@ -8020,623 +8810,6 @@ function handleSyncWorkforcePerformance(data) {
         };
 
 
-        const SettingsView = ({ tempUrl, setUrl, gasUrl, shopInfo, setShopInfo, staffList, setStaffList, staffProfiles, setStaffProfiles, quickServices, setQuickServices, records, setRecords, customers, setCustomers, cashRecords, setCashRecords, testConnection, isLoading, isSavingSettings, saveSettingsToCloud, currentPin, setCurrentPin, showAlert, showConfirm }) => {
-
-            const [activeSection, setActiveSection] = useState('cloud');
-
-            const [newStaffName, setNewStaffName] = useState('');
-
-            const [newStaffRole, setNewStaffRole] = useState('技師');
-
-            const [newService, setNewService] = useState({ name: '', partsPrice: '', laborHours: 0.15, stock: 10, minStock: 5, supplier: '', isBasicMaintenance: true });
-
-            const [newPin, setNewPin] = useState(currentPin || '0511');
-
-            const [showPinText, setShowPinText] = useState(false);
-
-            const logoInputRef = useRef(null);
-
-            const backupFileRef = useRef(null);
-
-
-
-            const handleLogoUpload = async (e) => {
-
-                const file = e.target.files && e.target.files[0];
-
-                if (file) {
-
-                    const compressed = await compressImage(file);
-
-                    if (compressed) setShopInfo({ ...shopInfo, logo: compressed });
-
-                }
-
-            };
-
-
-
-            const handleAddStaff = () => {
-
-                const trimmed = newStaffName.trim();
-
-                if (!trimmed) return showAlert('請輸入技師姓名');
-
-                if (staffList.includes(trimmed)) return showAlert('此技師已在名單中');
-
-                const preset = STAFF_ROLE_PRESETS[newStaffRole] || STAFF_ROLE_PRESETS['技師'];
-
-                const updatedList = [...staffList, trimmed];
-
-                const updatedProfiles = {
-
-                    ...(staffProfiles || {}),
-
-                    [trimmed]: {
-
-                        role: newStaffRole,
-
-                        years: 1,
-
-                        baseSalary: preset.defaultSalary,
-
-                        laborBonusRate: preset.baseLaborRate + 1,
-
-                        referralBonusRate: preset.baseReferralRate + 0.5
-
-                    }
-
-                };
-
-                setStaffList(updatedList);
-
-                setStaffProfiles(updatedProfiles);
-
-                setNewStaffName('');
-
-                saveSettingsToCloud(null, true, null, updatedProfiles, updatedList);
-
-            };
-
-
-
-            const handleRemoveStaff = (name) => {
-
-                showConfirm(`確定要從團隊名單中移除「${name}」嗎？`, () => {
-
-                    const updatedList = staffList.filter(s => s !== name);
-
-                    setStaffList(updatedList);
-
-                    saveSettingsToCloud(null, true, null, null, updatedList);
-
-                });
-
-            };
-
-
-
-            const handleAddService = () => {
-
-                if (!newService.name.trim()) return showAlert('請輸入維修項目名稱');
-
-                const item = {
-
-                    id: String(Date.now()),
-
-                    name: newService.name.trim(),
-
-                    partsPrice: cleanNumber(newService.partsPrice, 0),
-
-                    laborHours: cleanNumber(newService.laborHours, 0.1),
-
-                    stock: cleanNumber(newService.stock, 10),
-
-                    minStock: cleanNumber(newService.minStock, 5),
-
-                    supplier: newService.supplier.trim() || '一般材料商',
-
-                    isBasicMaintenance: Boolean(newService.isBasicMaintenance)
-
-                };
-
-                setQuickServices([...quickServices, item]);
-
-                setNewService({ name: '', partsPrice: '', laborHours: 0.15, stock: 10, minStock: 5, supplier: '', isBasicMaintenance: true });
-
-            };
-
-
-
-            const handleDownloadJsonBackup = () => {
-
-                const backupObj = {
-
-                    version: '3.0.0',
-
-                    exportDate: new Date().toISOString(),
-
-                    shopInfo,
-
-                    quickServices,
-
-                    staffList,
-
-                    staffProfiles,
-
-                    records,
-
-                    customers,
-
-                    cashRecords,
-
-                    adminPin: currentPin
-
-                };
-
-                const blob = new Blob([JSON.stringify(backupObj, null, 2)], { type: 'application/json' });
-
-                const url = URL.createObjectURL(blob);
-
-                const a = document.createElement('a');
-
-                a.href = url;
-
-                a.download = `SourceMoto_Backup_${getLocalDateString(new Date())}.json`;
-
-                a.click();
-
-            };
-
-
-
-            const handleRestoreJsonBackup = (e) => {
-
-                const file = e.target.files && e.target.files[0];
-
-                if (!file) return;
-
-                const reader = new FileReader();
-
-                reader.onload = (ev) => {
-
-                    try {
-
-                        const parsed = JSON.parse(ev.target.result);
-
-                        showConfirm('確定要還原此備份檔嗎？目前的本機資料將被備份檔覆蓋。', () => {
-
-                            if (parsed.shopInfo) setShopInfo(parsed.shopInfo);
-
-                            if (Array.isArray(parsed.quickServices)) setQuickServices(parsed.quickServices);
-
-                            if (Array.isArray(parsed.staffList)) setStaffList(parsed.staffList);
-
-                            if (parsed.staffProfiles) setStaffProfiles(parsed.staffProfiles);
-
-                            if (Array.isArray(parsed.records)) setRecords(parsed.records.map(normalizeRecord));
-
-                            if (Array.isArray(parsed.customers)) setCustomers(parsed.customers);
-
-                            if (Array.isArray(parsed.cashRecords)) setCashRecords(parsed.cashRecords);
-
-                            if (parsed.adminPin) setCurrentPin(String(parsed.adminPin));
-
-                            showAlert('✅ 資料備份檔已成功還原！');
-
-                        });
-
-                    } catch (err) {
-
-                        showAlert('❌ 備份檔格式錯誤，無法還原');
-
-                    }
-
-                };
-
-                reader.readAsText(file);
-
-            };
-
-
-
-            return (
-
-                <div className="max-w-5xl mx-auto space-y-5 pb-24 text-xs">
-
-                    <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-xs flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
-
-                        <div>
-
-                            <h2 className="text-lg font-black text-slate-800 flex items-center gap-2">
-
-                                <Settings className="text-blue-600" size={22}/> 系統設定與雲端資料庫備份
-
-                            </h2>
-
-                            <p className="text-slate-400 text-xs mt-0.5">管理 Google 試算表雲端連線、門市資訊、標準備料、技師名單與本地備份檔</p>
-
-                        </div>
-
-                        <button 
-
-                            type="button" 
-
-                            onClick={() => saveSettingsToCloud(null, false)} 
-
-                            disabled={isSavingSettings}
-
-                            className="px-4 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-black flex items-center gap-2 shadow-sm disabled:opacity-50"
-
-                        >
-
-                            {isSavingSettings ? <RefreshCw size={15} className="animate-spin"/> : <CloudCheck size={15}/>}
-
-                            <span>{isSavingSettings ? '正在同步至雲端...' : '立即全庫同步至雲端'}</span>
-
-                        </button>
-
-                    </div>
-
-
-
-                    <div className="flex flex-wrap gap-2 bg-white p-2 rounded-2xl border border-slate-200">
-
-                        {[
-
-                            { id: 'cloud', label: '☁️ 雲端與安全 PIN' },
-
-                            { id: 'shop', label: '🏪 門市資訊與費率' },
-
-                            { id: 'services', label: '🔧 標準備料項目' },
-
-                            { id: 'staff', label: '👨‍🔧 技師團隊名冊' },
-
-                            { id: 'backup', label: '💾 實體檔案備份還原' }
-
-                        ].map(tab => (
-
-                            <button 
-
-                                key={tab.id} 
-
-                                onClick={() => setActiveSection(tab.id)}
-
-                                className={`px-3.5 py-2 rounded-xl font-bold transition-all ${activeSection === tab.id ? 'bg-slate-900 text-white shadow-xs' : 'text-slate-600 hover:bg-slate-100'}`}
-
-                            >
-
-                                {tab.label}
-
-                            </button>
-
-                        ))}
-
-                    </div>
-
-
-
-                    {activeSection === 'cloud' && (
-
-                        <div className="bg-white p-5 rounded-2xl border border-slate-200 space-y-4">
-
-                            <div className="space-y-2">
-
-                                <label className="font-bold text-slate-700 text-sm block">Google Apps Script 雲端同步網址 (/exec)</label>
-
-                                <div className="flex flex-col sm:flex-row gap-2">
-
-                                    <input 
-
-                                        type="text" 
-
-                                        value={tempUrl} 
-
-                                        onChange={e => setUrl(e.target.value)} 
-
-                                        placeholder="https://script.google.com/macros/s/.../exec"
-
-                                        className="flex-1 p-2.5 border border-slate-300 rounded-xl font-mono text-xs outline-none focus:border-blue-500"
-
-                                    />
-
-                                    <button 
-
-                                        type="button" 
-
-                                        onClick={() => testConnection(tempUrl)} 
-
-                                        disabled={isLoading}
-
-                                        className="px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-bold flex items-center justify-center gap-1.5 shrink-0"
-
-                                    >
-
-                                        {isLoading ? <RefreshCw size={14} className="animate-spin"/> : <Cloud size={14}/>}
-
-                                        <span>儲存並測試雲端連線</span>
-
-                                    </button>
-
-                                </div>
-
-                            </div>
-
-
-
-                            <div className="border-t border-slate-100 pt-4 grid grid-cols-1 sm:grid-cols-2 gap-4">
-
-                                <div>
-
-                                    <label className="font-bold text-slate-700 block mb-1">主管授權 4 位數 PIN 碼</label>
-
-                                    <div className="flex gap-2">
-
-                                        <input 
-
-                                            type={showPinText ? "text" : "password"} 
-
-                                            maxLength={4}
-
-                                            value={newPin} 
-
-                                            onChange={e => setNewPin(e.target.value.replace(/\D/g, ''))} 
-
-                                            className="w-32 p-2 border border-slate-300 rounded-xl font-mono font-black text-center text-sm"
-
-                                        />
-
-                                        <button type="button" onClick={() => setShowPinText(!showPinText)} className="px-3 py-2 bg-slate-100 rounded-xl font-bold text-slate-600">
-
-                                            {showPinText ? '隱藏' : '顯示'}
-
-                                        </button>
-
-                                        <button 
-
-                                            type="button" 
-
-                                            onClick={() => {
-
-                                                if (newPin.length !== 4) return showAlert('PIN 碼須為 4 位數字');
-
-                                                setCurrentPin(newPin);
-
-                                                localStorage.setItem('moto_adminPin', newPin);
-
-                                                saveSettingsToCloud(null, false, newPin);
-
-                                            }}
-
-                                            className="px-4 py-2 bg-slate-800 text-white rounded-xl font-bold"
-
-                                        >
-
-                                            更新密碼
-
-                                        </button>
-
-                                    </div>
-
-                                </div>
-
-                                <div>
-
-                                    <label className="font-bold text-slate-700 block mb-1">Google Gemini API Key (選填)</label>
-
-                                    <input 
-
-                                        type="password" 
-
-                                        value={shopInfo.geminiApiKey || ''} 
-
-                                        onChange={e => setShopInfo({ ...shopInfo, geminiApiKey: e.target.value })} 
-
-                                        placeholder="留空時使用系統預設環境憑證"
-
-                                        className="w-full p-2 border border-slate-300 rounded-xl font-mono"
-
-                                    />
-
-                                </div>
-
-                            </div>
-
-                        </div>
-
-                    )}
-
-
-
-                    {activeSection === 'shop' && (
-
-                        <div className="bg-white p-5 rounded-2xl border border-slate-200 space-y-4">
-
-                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-
-                                <div>
-
-                                    <label className="font-bold text-slate-600 block mb-1">車行名稱</label>
-
-                                    <input type="text" value={shopInfo.name || ''} onChange={e => setShopInfo({ ...shopInfo, name: e.target.value })} className="w-full p-2.5 border border-slate-300 rounded-xl font-bold"/>
-
-                                </div>
-
-                                <div>
-
-                                    <label className="font-bold text-slate-600 block mb-1">聯絡電話</label>
-
-                                    <input type="text" value={shopInfo.phone || ''} onChange={e => setShopInfo({ ...shopInfo, phone: e.target.value })} className="w-full p-2.5 border border-slate-300 rounded-xl font-bold"/>
-
-                                </div>
-
-                                <div>
-
-                                    <label className="font-bold text-slate-600 block mb-1">門市地址</label>
-
-                                    <input type="text" value={shopInfo.address || ''} onChange={e => setShopInfo({ ...shopInfo, address: e.target.value })} className="w-full p-2.5 border border-slate-300 rounded-xl"/>
-
-                                </div>
-
-                                <div>
-
-                                    <label className="font-bold text-slate-600 block mb-1">統一編號</label>
-
-                                    <input type="text" value={shopInfo.taxId || ''} onChange={e => setShopInfo({ ...shopInfo, taxId: e.target.value })} className="w-full p-2.5 border border-slate-300 rounded-xl font-mono"/>
-
-                                </div>
-
-                                <div>
-
-                                    <label className="font-bold text-slate-600 block mb-1">標準工資時薪率 ($/hr)</label>
-
-                                    <input type="number" value={shopInfo.hourlyRate || 800} onChange={e => setShopInfo({ ...shopInfo, hourlyRate: cleanNumber(e.target.value, 800) })} className="w-full p-2.5 border border-slate-300 rounded-xl font-mono font-bold"/>
-
-                                </div>
-
-                                <div>
-
-                                    <label className="font-bold text-slate-600 block mb-1">預設介紹人零件抽成率 (%)</label>
-
-                                    <input type="number" value={shopInfo.referrerCommissionRate || 20} onChange={e => setShopInfo({ ...shopInfo, referrerCommissionRate: cleanNumber(e.target.value, 20) })} className="w-full p-2.5 border border-slate-300 rounded-xl font-mono font-bold"/>
-
-                                </div>
-
-                                <div className="sm:col-span-2">
-
-                                    <label className="font-bold text-slate-600 block mb-1">收據底部叮嚀備註</label>
-
-                                    <input type="text" value={shopInfo.note || ''} onChange={e => setShopInfo({ ...shopInfo, note: e.target.value })} className="w-full p-2.5 border border-slate-300 rounded-xl"/>
-
-                                </div>
-
-                            </div>
-
-                        </div>
-
-                    )}
-
-
-
-                    {activeSection === 'services' && (
-
-                        <div className="bg-white p-5 rounded-2xl border border-slate-200 space-y-4">
-
-                            <div className="grid grid-cols-2 sm:grid-cols-6 gap-2 bg-slate-50 p-3 rounded-xl border border-slate-200">
-
-                                <input type="text" placeholder="零件/服務名稱" value={newService.name} onChange={e => setNewService({ ...newService, name: e.target.value })} className="col-span-2 p-2 border border-slate-300 rounded-lg bg-white font-bold"/>
-
-                                <input type="number" placeholder="零件費($)" value={newService.partsPrice} onChange={e => setNewService({ ...newService, partsPrice: e.target.value })} className="p-2 border border-slate-300 rounded-lg bg-white font-mono"/>
-
-                                <input type="number" step="0.05" placeholder="工時(h)" value={newService.laborHours} onChange={e => setNewService({ ...newService, laborHours: e.target.value })} className="p-2 border border-slate-300 rounded-lg bg-white font-mono"/>
-
-                                <input type="text" placeholder="供料廠商" value={newService.supplier} onChange={e => setNewService({ ...newService, supplier: e.target.value })} className="p-2 border border-slate-300 rounded-lg bg-white"/>
-
-                                <button type="button" onClick={handleAddService} className="bg-blue-600 text-white rounded-lg font-bold px-3 py-2">+ 新增品項</button>
-
-                            </div>
-
-                            <div className="divide-y divide-slate-100">
-
-                                {quickServices.map(s => (
-
-                                    <div key={s.id} className="py-2.5 flex justify-between items-center">
-
-                                        <div>
-
-                                            <span className="font-bold text-slate-800">{s.name}</span>
-
-                                            <span className="ml-2 text-slate-400">料 ${s.partsPrice} | 工時 {s.laborHours}h | 存量 {s.stock} | {s.supplier || '未設定廠商'}</span>
-
-                                        </div>
-
-                                        <button type="button" onClick={() => setQuickServices(quickServices.filter(x => x.id !== s.id))} className="text-red-500 hover:bg-red-50 p-1.5 rounded-lg"><Trash2 size={15}/></button>
-
-                                    </div>
-
-                                ))}
-
-                            </div>
-
-                        </div>
-
-                    )}
-
-
-
-                    {activeSection === 'staff' && (
-
-                        <div className="bg-white p-5 rounded-2xl border border-slate-200 space-y-4">
-
-                            <div className="flex gap-2">
-
-                                <input type="text" placeholder="輸入新技師姓名" value={newStaffName} onChange={e => setNewStaffName(e.target.value)} className="flex-1 p-2.5 border border-slate-300 rounded-xl font-bold"/>
-
-                                <select value={newStaffRole} onChange={e => setNewStaffRole(e.target.value)} className="p-2.5 border border-slate-300 rounded-xl font-bold bg-white">
-
-                                    {Object.keys(STAFF_ROLE_PRESETS).map(r => <option key={r} value={r}>{STAFF_ROLE_PRESETS[r].title}</option>)}
-
-                                </select>
-
-                                <button type="button" onClick={handleAddStaff} className="px-4 py-2.5 bg-blue-600 text-white rounded-xl font-bold">+ 新增技師</button>
-
-                            </div>
-
-                            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-
-                                {staffList.map(st => (
-
-                                    <div key={st} className="p-3 border border-slate-200 rounded-xl flex justify-between items-center bg-slate-50">
-
-                                        <span className="font-black text-slate-800 text-sm">{st}</span>
-
-                                        <button type="button" onClick={() => handleRemoveStaff(st)} className="text-red-500 hover:bg-red-50 p-1.5 rounded-lg"><Trash2 size={15}/></button>
-
-                                    </div>
-
-                                ))}
-
-                            </div>
-
-                        </div>
-
-                    )}
-
-
-
-                    {activeSection === 'backup' && (
-
-                        <div className="bg-white p-5 rounded-2xl border border-slate-200 space-y-4">
-
-                            <div className="flex flex-col sm:flex-row gap-3">
-
-                                <button type="button" onClick={handleDownloadJsonBackup} className="flex-1 py-3 bg-slate-900 hover:bg-slate-800 text-white rounded-xl font-bold flex items-center justify-center gap-2">
-
-                                    <DownloadSimple size={18}/> 下載完整系統備份檔 (.json)
-
-                                </button>
-
-                                <button type="button" onClick={() => backupFileRef.current.click()} className="flex-1 py-3 bg-amber-500 hover:bg-amber-600 text-white rounded-xl font-bold flex items-center justify-center gap-2">
-
-                                    <UploadSimple size={18}/> 匯入還原系統備份檔 (.json)
-
-                                </button>
-
-                                <input ref={backupFileRef} type="file" accept=".json" className="hidden" onChange={handleRestoreJsonBackup}/>
-
-                            </div>
-
-                        </div>
-
-                    )}
-
-                </div>
-
-            );
-
-        };
-
-
 
         const ReceiptModal = ({ showReceiptModal, setShowReceiptModal, selectedRecord, shopInfo, gasUrl, showAlert }) => {
 
@@ -9138,41 +9311,53 @@ function handleSyncWorkforcePerformance(data) {
                 try {
                     const res = await safeFetchGAS(urlToUse, { action: 'get_all' });
                     if (res.ok && res.data && res.data.status === 'success') {
-                        // 1. 工單雙向智慧合流：以 ID 為準，保留雲端其他裝置的新增工單與完整維修內容
+                        // 1. 工單雙向智慧合流：確保無 ID 或重複 ID 的 6~10 月歷史工單皆能生成唯一識別碼並完整載入
                         if (Array.isArray(res.data.records)) {
                             setRecords(prev => {
                                 if (res.data.records.length === 0 && prev.length > 0) {
                                     return prev;
                                 }
                                 const prevMap = new Map();
-                                prev.forEach(p => {
-                                    if (p && p.id) prevMap.set(String(p.id), normalizeRecord(p));
+                                prev.forEach((p, idx) => {
+                                    if (p) {
+                                        const normP = normalizeRecord(p, idx);
+                                        prevMap.set(String(normP.id), normP);
+                                    }
                                 });
 
                                 const map = new Map();
-                                // 先放雲端回傳的最新工單，若雲端缺明細但本地有明細則互補保留
-                                res.data.records.forEach(r => { 
-                                    if (r && r.id) {
-                                        const normCloud = normalizeRecord(r);
-                                        const normLocal = prevMap.get(String(r.id));
+                                res.data.records.forEach((r, idx) => { 
+                                    if (r && (r.plate || r.date || r.total !== undefined || r.human_items || r.id)) {
+                                        const normCloud = normalizeRecord(r, idx);
+                                        let key = String(normCloud.id);
+                                        // 若遇到同分頁內舊資料 ID 碰撞，但車牌或日期不同，自動加上列索引確保不互相覆蓋
+                                        if (map.has(key)) {
+                                            const existing = map.get(key);
+                                            if (existing.plate !== normCloud.plate || existing.date !== normCloud.date || existing.total !== normCloud.total) {
+                                                key = `${key}_ROW_${idx}`;
+                                                normCloud.id = key;
+                                            }
+                                        }
+                                        const normLocal = prevMap.get(key);
                                         if (normLocal && (!normCloud.items || normCloud.items.length === 0) && normLocal.items && normLocal.items.length > 0) {
                                             normCloud.items = normLocal.items;
                                             normCloud.human_items = normLocal.human_items || buildHumanItemsStr(normLocal.items, '');
                                         }
-                                        // 若雲端判定此單已歸檔完工，強制以 completed 為準，避免本地舊緩存將其留在維修中
                                         if (normCloud.status === 'completed') {
                                             normCloud.progressStage = '已完工';
                                         }
-                                        map.set(String(r.id), normCloud); 
+                                        map.set(key, normCloud); 
                                     }
                                 });
-                                // 若本地端有尚未同步完畢的新單，暫時保留
-                                prev.forEach(r => { 
-                                    if (r && r.id && !map.has(String(r.id))) {
-                                        map.set(String(r.id), normalizeRecord(r)); 
+                                prev.forEach((r, idx) => { 
+                                    if (r) {
+                                        const normLocal = normalizeRecord(r, idx);
+                                        if (!map.has(String(normLocal.id))) {
+                                            map.set(String(normLocal.id), normLocal); 
+                                        }
                                     }
                                 });
-                                return Array.from(map.values()).sort((a, b) => parseDateSafe(b.timestamp || b.date) - parseDateSafe(a.timestamp || a.date));
+                                return Array.from(map.values()).sort((a, b) => parseDateSafe(b.date || b.timestamp) - parseDateSafe(a.date || a.timestamp));
                             });
                         }
 
@@ -9203,7 +9388,18 @@ function handleSyncWorkforcePerformance(data) {
                                 try { parsedShopInfo = JSON.parse(parsedShopInfo); } catch (e) {}
                             }
                             if (parsedShopInfo && typeof parsedShopInfo === 'object') {
-                                setShopInfo(prev => ({ ...prev, ...parsedShopInfo }));
+                                setShopInfo(prev => {
+                                    const savedCustomLogo = loadFromLocal('moto_customLogo', null, false);
+                                    const incomingLogo = parsedShopInfo.logo;
+                                    // ★ 關鍵防護：若本機已上傳自訂 Logo，而雲端傳回空值或預設舊 Logo，強制保留本機自訂 Logo！
+                                    let finalLogo = incomingLogo || prev.logo || DEFAULT_LOGO;
+                                    if (savedCustomLogo && (!incomingLogo || incomingLogo === DEFAULT_LOGO)) {
+                                        finalLogo = savedCustomLogo;
+                                    } else if (incomingLogo && incomingLogo !== DEFAULT_LOGO) {
+                                        saveToLocalSafe('moto_customLogo', incomingLogo);
+                                    }
+                                    return { ...prev, ...parsedShopInfo, logo: finalLogo };
+                                });
                             }
 
                             let parsedServices = settings.quickServices;
@@ -9334,12 +9530,13 @@ function handleSyncWorkforcePerformance(data) {
             };
 
             // ★★★ 安全設定儲存：若後端有舊邏輯，隨附過濾相片後的輕量工單以防被清空 ★★★
-            const saveSettingsToCloud = async (customCash = null, silent = false, updatedPin = null, customProfiles = null, customStaffList = null, customRows = null, customCustomers = null, customRecords = null) => {
+            const saveSettingsToCloud = async (customCash = null, silent = false, updatedPin = null, customProfiles = null, customStaffList = null, customRows = null, customCustomers = null, customRecords = null, customShopInfo = null) => {
                 setIsSavingSettings(true);
                 const pinToSave = updatedPin || currentPin;
                 const profilesToSave = customProfiles || staffProfiles;
                 const staffListToSave = customStaffList || staffList;
                 const customersToSave = customCustomers || customers;
+                const baseShop = customShopInfo || shopInfo;
 
                 // 產出分欄分行陣列（每位技師各獨立一行與欄位）
                 const rowsToSave = customRows || staffListToSave.map(name => {
@@ -9355,7 +9552,7 @@ function handleSyncWorkforcePerformance(data) {
                 });
 
                 const updatedShopInfo = {
-                    ...shopInfo,
+                    ...baseShop,
                     staffProfiles: profilesToSave
                 };
                 // 建立輕量化安全工單備份（保留標準日期、時間戳記與完整維修保養內容）
@@ -9857,6 +10054,8 @@ function handleSyncWorkforcePerformance(data) {
                                 <SettingsView 
                                     tempUrl={tempUrl}
                                     setUrl={setTempUrl}
+                                    gasUrl={gasUrl}
+                                    fetchCloudData={fetchCloudData}
                                     shopInfo={shopInfo}
                                     setShopInfo={setShopInfo}
                                     staffList={staffList}
